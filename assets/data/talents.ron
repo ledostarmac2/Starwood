@@ -1,0 +1,50 @@
+[
+    (
+        class: "fighter",
+        nodes: [
+            (id: "fighter_guarded_footwork", name: "Guarded Footwork", description: "Improve rank-swap defense after moving.", rank: 1, cost: 1),
+            (id: "fighter_second_wind_mastery", name: "Second Wind Mastery", description: "Reduce Second Wind cooldown by one turn.", rank: 2, cost: 1, requires: ["fighter_guarded_footwork"], unlock_level: 3),
+            (id: "fighter_vanguard", name: "Vanguard", description: "Subclass path: hold the front rank with heroic resolve.", rank: 3, cost: 2, requires: ["fighter_second_wind_mastery"], unlock_level: 10),
+        ],
+    ),
+    (
+        class: "rogue",
+        nodes: [
+            (id: "rogue_quick_hands", name: "Quick Hands", description: "Consumable use is easier to weave into a turn.", rank: 1, cost: 1),
+            (id: "rogue_shadow_angle", name: "Shadow Angle", description: "Back-rank attacks gain a small accuracy edge.", rank: 2, cost: 1, requires: ["rogue_quick_hands"], unlock_level: 3),
+            (id: "rogue_nightblade", name: "Nightblade", description: "Subclass path: vanish, strike, and punish isolated foes.", rank: 3, cost: 2, requires: ["rogue_shadow_angle"], unlock_level: 10),
+        ],
+    ),
+    (
+        class: "wizard",
+        nodes: [
+            (id: "wizard_deeper_well", name: "Deeper Well", description: "Increase maximum mana.", rank: 1, cost: 1),
+            (id: "wizard_fast_formula", name: "Fast Formula", description: "Reduce one spell cooldown after a natural flourish.", rank: 2, cost: 1, requires: ["wizard_deeper_well"], unlock_level: 3),
+            (id: "wizard_star_sage", name: "Star Sage", description: "Subclass path: bend starfire into precise rank-wide magic.", rank: 3, cost: 2, requires: ["wizard_fast_formula"], unlock_level: 10),
+        ],
+    ),
+    (
+        class: "cleric",
+        nodes: [
+            (id: "cleric_bright_channel", name: "Bright Channel", description: "Improve healing efficiency during encounters.", rank: 1, cost: 1),
+            (id: "cleric_hymn_guard", name: "Hymn Guard", description: "Blessing also steadies the ally's rank.", rank: 2, cost: 1, requires: ["cleric_bright_channel"], unlock_level: 3),
+            (id: "cleric_dawn_oath", name: "Dawn Oath", description: "Subclass path: turn mercy into a weapon against the dark.", rank: 3, cost: 2, requires: ["cleric_hymn_guard"], unlock_level: 10),
+        ],
+    ),
+    (
+        class: "ranger",
+        nodes: [
+            (id: "ranger_patient_aim", name: "Patient Aim", description: "Improve ranged attacks against rear ranks.", rank: 1, cost: 1),
+            (id: "ranger_binding_growth", name: "Binding Growth", description: "Binding Thorn catches adjacent ranks.", rank: 2, cost: 1, requires: ["ranger_patient_aim"], unlock_level: 3),
+            (id: "ranger_wildwarden", name: "Wildwarden", description: "Subclass path: command the route and punish overextension.", rank: 3, cost: 2, requires: ["ranger_binding_growth"], unlock_level: 10),
+        ],
+    ),
+    (
+        class: "warlock",
+        nodes: [
+            (id: "warlock_pact_spark", name: "Pact Spark", description: "Restore a little mana when a marked foe falls.", rank: 1, cost: 1),
+            (id: "warlock_dread_brand", name: "Dread Brand", description: "Hexing Brand lingers for one extra turn.", rank: 2, cost: 1, requires: ["warlock_pact_spark"], unlock_level: 3),
+            (id: "warlock_ashen_heir", name: "Ashen Heir", description: "Subclass path: spend life, mana, and oaths for terrible power.", rank: 3, cost: 2, requires: ["warlock_dread_brand"], unlock_level: 10),
+        ],
+    ),
+]

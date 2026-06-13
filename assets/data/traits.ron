@@ -1,0 +1,16 @@
+[
+    (id: "versatile", name: "Versatile", description: "Gain one extra skill proficiency during creation."),
+    (id: "darkvision", name: "Darkvision", description: "See clearly through gloom and underground passages."),
+    (id: "fey_ancestry", name: "Fey Ancestry", description: "Resist charms and unnatural sleep."),
+    (id: "stonecunning", name: "Stonecunning", description: "Read stonework, ruins, and tunnel hazards."),
+    (id: "lucky", name: "Lucky", description: "Once per encounter, reroll a natural 1."),
+    (id: "relentless", name: "Relentless", description: "Stay standing at 1 HP once per run."),
+    (id: "hellish_resistance", name: "Hellish Resistance", description: "Resist fire and infernal hazards."),
+    (id: "trailwise", name: "Trailwise", description: "Improve event outcomes on wilderness nodes."),
+    (id: "battle_hardened", name: "Battle Hardened", description: "Gain resolve when an encounter begins badly."),
+    (id: "bookwise", name: "Bookwise", description: "Improve lore checks at event and treasure nodes."),
+    (id: "camp_cook", name: "Camp Cook", description: "Rest nodes restore a little extra HP."),
+    (id: "duelist", name: "Duelist", description: "Gain a small edge when fighting a single enemy."),
+    (id: "quick_hands", name: "Quick Hands", description: "Swap consumables with less turn pressure."),
+    (id: "warded", name: "Warded", description: "Resist the first hostile spell in an encounter."),
+]
