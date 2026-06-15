@@ -11,23 +11,27 @@
 //! `starwood_core`.
 
 mod art;
+mod debug;
 mod effects;
 mod icons;
 mod paperdoll;
 mod rarity;
 
 pub use art::{BODY_SIZE, FRAME_SIZE, ITEM_SIZE};
+pub use debug::RenderDebugOverlay;
 pub use effects::DownedVisual;
-pub use icons::{instance_icon_handle, ItemIcon, item_icon_handle, rarity_frame_handle};
+pub use icons::{
+    ItemIcon, instance_icon_handle, item_icon_handle, rarity_frame_handle, rarity_frame_handle_tier,
+};
 pub use paperdoll::{UnitLayer, UnitVisual};
-pub use rarity::{RARITY_TIERS, RarityStyle, rarity_frame_key, rarity_style};
+pub use rarity::{RARITY_TIERS, RarityStyle, rarity_frame_key, rarity_frame_key_for, rarity_style};
 
 use bevy::prelude::*;
 use bevy_tweening::TweeningPlugin;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
-use starwood_core::{AssetHandles, GameData};
-use std::collections::HashMap;
+use starwood_core::{AssetHandles, GameData, rarity_rank};
+use std::collections::{HashMap, HashSet};
 
 /// World-space scale applied to every 64x64 unit so placeholder art reads at a
 /// comfortable size on screen.
@@ -61,6 +65,7 @@ impl Plugin for StarwoodRenderPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(TweeningPlugin)
             .init_resource::<SpriteManifest>()
+            .init_resource::<RenderDebugOverlay>()
             .insert_resource(RenderRng(ChaCha8Rng::seed_from_u64(0x5757_0D17_u64)))
             .add_systems(Startup, setup_scene)
             .add_systems(
@@ -75,6 +80,7 @@ impl Plugin for StarwoodRenderPlugin {
                     effects::react_to_damage,
                     effects::run_shake,
                     effects::run_flash,
+                    effects::sync_downed_from_core,
                     effects::route_unit_death,
                     effects::run_death_fade,
                     effects::apply_downed_visual,
@@ -83,6 +89,14 @@ impl Plugin for StarwoodRenderPlugin {
                 )
                     .chain()
                     .in_set(RenderSet),
+            )
+            .add_systems(
+                Update,
+                (
+                    debug::toggle_debug_overlay,
+                    debug::sync_debug_rank_markers,
+                    debug::update_debug_unit_markers,
+                ),
             );
     }
 }
@@ -99,6 +113,65 @@ pub struct SpriteManifest {
 impl SpriteManifest {
     pub fn get(&self, key: &str) -> Option<Handle<Image>> {
         self.handles.get(key).cloned()
+    }
+
+    /// Insert a generated body placeholder if `key` is not yet registered.
+    pub fn ensure_body(
+        &mut self,
+        images: &mut Assets<Image>,
+        asset_handles: &mut AssetHandles,
+        key: &str,
+    ) -> Option<Handle<Image>> {
+        if let Some(handle) = self.get(key) {
+            return Some(handle);
+        }
+        Some(register(
+            self,
+            images,
+            asset_handles,
+            key,
+            art::generate_body(key),
+        ))
+    }
+
+    /// Insert a generated item placeholder if the item's sprite key is missing.
+    pub fn ensure_item(
+        &mut self,
+        images: &mut Assets<Image>,
+        asset_handles: &mut AssetHandles,
+        item: &starwood_core::ItemData,
+    ) -> Option<Handle<Image>> {
+        if let Some(handle) = self.get(&item.sprite_key) {
+            return Some(handle);
+        }
+        Some(register(
+            self,
+            images,
+            asset_handles,
+            &item.sprite_key,
+            art::generate_item(item),
+        ))
+    }
+
+    /// Last-resort fallback for unknown keys (never returns None once images exist).
+    pub fn ensure_fallback(
+        &mut self,
+        images: &mut Assets<Image>,
+        asset_handles: &mut AssetHandles,
+        key: &str,
+        width: u32,
+        height: u32,
+    ) -> Handle<Image> {
+        if let Some(handle) = self.get(key) {
+            return handle;
+        }
+        register(
+            self,
+            images,
+            asset_handles,
+            key,
+            art::generate_fallback_sprite(key, width, height),
+        )
     }
 }
 
@@ -144,9 +217,25 @@ pub fn rank_scale(slot: u8) -> f32 {
     1.0 - RANK_DEPTH_FALLOFF * slot.min(4) as f32
 }
 
-/// Build all placeholder textures once `GameData` has loaded, registering each
-/// under its sprite key in both the local manifest and the shared
-/// `AssetHandles` resource.
+/// Collect every sprite key referenced by loaded `GameData`.
+pub fn collect_sprite_keys(data: &GameData) -> HashSet<String> {
+    let mut keys = HashSet::new();
+    for race in data.races.values() {
+        keys.insert(race.sprite_key.clone());
+    }
+    for enemy in data.enemies.values() {
+        keys.insert(enemy.sprite_key.clone());
+    }
+    for item in data.items.values() {
+        keys.insert(item.sprite_key.clone());
+    }
+    for tier in 0..RARITY_TIERS {
+        keys.insert(rarity::rarity_frame_key(tier));
+    }
+    keys
+}
+
+/// Build all placeholder textures once `GameData` has loaded.
 fn generate_placeholders(
     mut manifest: ResMut<SpriteManifest>,
     mut images: ResMut<Assets<Image>>,
@@ -157,26 +246,67 @@ fn generate_placeholders(
         return;
     }
     if data.races.is_empty() && data.items.is_empty() && data.enemies.is_empty() {
-        return; // data not loaded yet
+        return;
     }
 
     for race in data.races.values() {
-        register(&mut manifest, &mut images, &mut handles, &race.sprite_key, art::generate_body(&race.sprite_key));
+        register(
+            &mut manifest,
+            &mut images,
+            &mut handles,
+            &race.sprite_key,
+            art::generate_body(&race.sprite_key),
+        );
     }
     for enemy in data.enemies.values() {
-        register(&mut manifest, &mut images, &mut handles, &enemy.sprite_key, art::generate_enemy(&enemy.sprite_key));
+        register(
+            &mut manifest,
+            &mut images,
+            &mut handles,
+            &enemy.sprite_key,
+            art::generate_enemy(&enemy.sprite_key),
+        );
     }
     for item in data.items.values() {
-        register(&mut manifest, &mut images, &mut handles, &item.sprite_key, art::generate_item(item));
+        register(
+            &mut manifest,
+            &mut images,
+            &mut handles,
+            &item.sprite_key,
+            art::generate_item(item),
+        );
     }
-    // Rarity frames are keyed by tier (mapped from core `Rarity` via `rarity_rank`).
-    for tier in 0..rarity::RARITY_TIERS {
+    for (rarity, row) in &data.rarities {
+        let tier = rarity_rank(*rarity);
         let key = rarity::rarity_frame_key(tier);
-        register(&mut manifest, &mut images, &mut handles, &key, art::generate_rarity_frame(tier));
+        register(
+            &mut manifest,
+            &mut images,
+            &mut handles,
+            &key,
+            art::generate_rarity_frame_from_color(row.frame_color, tier),
+        );
+    }
+
+    let expected = collect_sprite_keys(&data);
+    let missing: Vec<_> = expected
+        .iter()
+        .filter(|k| !manifest.handles.contains_key(k.as_str()))
+        .collect();
+    if !missing.is_empty() {
+        warn!(
+            "starwood_render: {} sprite keys still missing after generation: {:?}",
+            missing.len(),
+            missing
+        );
     }
 
     manifest.ready = true;
-    info!("starwood_render: generated {} placeholder sprites", manifest.handles.len());
+    info!(
+        "starwood_render: generated {} placeholder sprites ({} expected from GameData)",
+        manifest.handles.len(),
+        expected.len()
+    );
 }
 
 fn register(
@@ -185,10 +315,11 @@ fn register(
     handles: &mut AssetHandles,
     key: &str,
     image: Image,
-) {
+) -> Handle<Image> {
     let handle = images.add(image);
     handles.sprites.insert(key.to_string(), handle.clone());
-    manifest.handles.insert(key.to_string(), handle);
+    manifest.handles.insert(key.to_string(), handle.clone());
+    handle
 }
 
 #[cfg(test)]
@@ -199,7 +330,10 @@ mod tests {
     #[test]
     fn party_ranks_march_front_to_back_on_the_left() {
         for slot in 0u8..4 {
-            assert!(party_slot_position(slot).x < 0.0, "party rank {slot} should be left of center");
+            assert!(
+                party_slot_position(slot).x < 0.0,
+                "party rank {slot} should be left of center"
+            );
         }
         // Back ranks sit further from center and render behind the front rank.
         assert!(party_slot_position(3).x < party_slot_position(0).x);
@@ -212,7 +346,10 @@ mod tests {
     #[test]
     fn enemy_ranks_march_front_to_back_on_the_right() {
         for slot in 0u8..5 {
-            assert!(enemy_slot_position(slot).x > 0.0, "enemy rank {slot} should be right of center");
+            assert!(
+                enemy_slot_position(slot).x > 0.0,
+                "enemy rank {slot} should be right of center"
+            );
         }
         assert!(enemy_slot_position(4).x > enemy_slot_position(0).x);
         assert_eq!(enemy_slot_position(4), enemy_slot_position(12));
@@ -244,9 +381,15 @@ mod tests {
             description: String::new(),
             slot: ItemSlot::MainHand,
             armor_bonus: 0,
-            damage: Some(DiceExpr { count: 1, sides: 8, modifier: 0 }),
+            damage: Some(DiceExpr {
+                count: 1,
+                sides: 8,
+                modifier: 0,
+            }),
             sprite_key: "item_iron_sword".into(),
             value: 15,
+            consumable: None,
+            tags: vec![],
         };
         let icon = art::generate_item(&item);
         assert_eq!(icon.width(), ITEM_SIZE);
@@ -254,11 +397,71 @@ mod tests {
     }
 
     #[test]
+    fn all_game_data_sprite_keys_have_placeholders() {
+        let assets_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/data");
+        let data = starwood_core::load_game_data_from_dir(assets_dir.to_str().expect("utf-8 path"))
+            .expect("assets/data should parse");
+        let keys = collect_sprite_keys(&data);
+        assert!(
+            keys.len() >= 6 + 8 + 16 + RARITY_TIERS as usize,
+            "expected full catalog coverage"
+        );
+
+        let mut manifest = SpriteManifest::default();
+        let mut images = Assets::<Image>::default();
+        let mut handles = AssetHandles::default();
+
+        for race in data.races.values() {
+            register(
+                &mut manifest,
+                &mut images,
+                &mut handles,
+                &race.sprite_key,
+                art::generate_body(&race.sprite_key),
+            );
+        }
+        for enemy in data.enemies.values() {
+            register(
+                &mut manifest,
+                &mut images,
+                &mut handles,
+                &enemy.sprite_key,
+                art::generate_enemy(&enemy.sprite_key),
+            );
+        }
+        for item in data.items.values() {
+            register(
+                &mut manifest,
+                &mut images,
+                &mut handles,
+                &item.sprite_key,
+                art::generate_item(item),
+            );
+        }
+        for (rarity, row) in &data.rarities {
+            let tier = rarity_rank(*rarity);
+            register(
+                &mut manifest,
+                &mut images,
+                &mut handles,
+                &rarity::rarity_frame_key(tier),
+                art::generate_rarity_frame_from_color(row.frame_color, tier),
+            );
+        }
+
+        for key in &keys {
+            assert!(
+                manifest.handles.contains_key(key),
+                "missing placeholder for sprite key {key}"
+            );
+        }
+    }
+
+    #[test]
     fn placeholder_generation_is_deterministic() {
         let a = art::generate_enemy("enemy_wolf");
         let b = art::generate_enemy("enemy_wolf");
         assert_eq!(a.data, b.data);
-        // Distinct keys should not collapse to identical art.
         let c = art::generate_enemy("enemy_ogre_brute");
         assert_ne!(a.data, c.data);
     }

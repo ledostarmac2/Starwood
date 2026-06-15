@@ -2,13 +2,14 @@
 
 Owned by the render crate (`starwood_render`).
 
-This folder is intentionally (mostly) empty: all character, enemy, and item
-sprites are **generated programmatically at runtime** as placeholders, keyed by
-the `sprite_key` fields in `assets/data/*.ron`.
+This folder is intentionally empty at rest: **all sprites are generated
+programmatically at runtime** from keys in `assets/data/*.ron` (races, enemies,
+items, and rarity frames). See `crates/starwood_render/README.md`.
 
-- Race base bodies & enemy archetypes: 64×64
+- Race/enemy bodies: 64×64
 - Items: 32×32
+- Rarity frames: 48×48 (colors from core `RarityData`)
 
-To ship real art, drop image files here and load them over the handle stored
-under the matching sprite key in the shared `AssetHandles.sprites` map (see
-`crates/starwood_render/README.md`). No gameplay or layout code needs to change.
+Press **F3** in-game to toggle rank/anchor debug overlays.
+
+Real art can replace placeholders by overwriting handles in `AssetHandles.sprites`.

@@ -1,88 +1,97 @@
 # starwood_ui
 
-The UI layer for **Starwood**: every egui screen plus the **Dice Theater**. This
-crate depends only on `starwood_core` and obeys the Shared Contract (Section 4 of
-the build blueprint). It never edits `starwood_core` or `starwood_render`.
+The UI layer for **Starwood**: every egui screen, the combat UI, the inventory /
+shop, a debug overlay, and the **Dice Theater**. It depends only on
+`starwood_core`, imports all shared types from there, and never edits another
+crate.
 
-Add it with `StarwoodUiPlugin` (the binary already does this).
+Add it with `StarwoodUiPlugin` (the binary already does).
 
-## What's in here
+## Modules
 
 | Module | Responsibility |
 |---|---|
-| `theme` | Fantasy egui theme: dark gold-and-parchment palette, framed panels, optional display font from `assets/fonts/`. |
-| `menu` | Main menu (New Game / Continue / Quit) and the Game Over screen. |
-| `creation` | Animated character creation across the `CreationStep` sub-states. |
-| `hud` | Persistent party panel, the Exploration map, the encounter turn order, the action bar, and the small flow systems that keep combat moving. |
-| `inventory` | Inventory overlay (equip/unequip), character sheet, and skills tab. |
+| `theme` | Fantasy egui theme + rarity-frame colours + optional display font from `assets/fonts/`. |
+| `menu` | Main menu: difficulty select, 3 campaign slots (continue/delete), New Game. |
+| `creation` | One full PC (Race → Class → Abilities → Talents → Review) then the 3 companion **classes** (Companions step). |
+| `hud` | Party panel (HP/mana/gold, revive), Exploration map, and the encounter combat UI + turn advancement. |
+| `inventory` | 20-slot inventory on rolled item instances (rarity frames, affix tooltips), shop buy/sell, character sheet, skills tab, talent tree + subclass. |
+| `debug` | Toggleable overlay (F1). |
+| `save` | Autosave slot, index on startup, deferred Continue load. |
 | `dice` | The Dice Theater. |
 
-### Schedules
+egui draws in **`EguiPrimaryContextPass`**; world/sprite/flow logic in **`Update`**.
 
-egui draws in **`EguiPrimaryContextPass`** (required by bevy_egui 0.39's
-multipass primary context). All world/sprite/animation/flow logic runs in
-**`Update`**. The egui systems are chained so the theme is applied first and the
-inventory overlay draws last; because they all borrow the egui context mutably
-they are serialised anyway.
+## The UI drives the live game through messages
 
-## The Dice Theater (event flow)
+`starwood_core` is authoritative and message-driven. The UI **fires request
+messages and reflects state** — it never resolves rules itself:
 
-The theater is the marquee feature and the one place getting the contract exactly
-right matters most:
+| Player action | Message fired | Core does |
+|---|---|---|
+| New Game | `NewGameRequested { seed }` | reset run, generate map, → creation |
+| Continue a step | `CreationStepAdvanceRequested` | advance the `CreationStep` sub-state |
+| Confirm the PC | `CharacterBuildRequested { … }` | spawn the PC entity (first = `PlayerCharacter`) |
+| Begin expedition | `FinishPartyCreationRequested` | → Exploration |
+| Enter a fight | `EncounterRequested { difficulty }` | spawn foes, roll initiative, build turn order, → Encounter |
+| Attack / Cast | `CombatActionRequest { actor, target, Attack }` | build the attack roll, resolve, apply damage on completion |
+| Surrender | `SurrenderRequested { actor }` | end encounter to the narrative/Exploration branch |
+| Use a potion | `ConsumableUseRequested { actor, item }` | apply the consumable |
+| Buy / sell | `ShopTransactionRequested { item, … }` | move gold + inventory |
+| Revive a downed PC | `ReviveAttempt { entity }` | pay the cost, clear `Downed` |
+
+The **one** combat job the UI owns is **turn advancement**: core never moves
+`ActiveTurn`, so `hud::advance_turn_after_action` moves it to the next living
+combatant once an action resolves. `hud::drive_enemy_turns` fires an enemy's
+`CombatActionRequest` on its turn. Equip/unequip mutate `Equipment` + fire
+`EquipmentChanged`/`InventoryChanged`; shop stock is rolled into core's
+`ItemInstances`.
+
+## Dice Theater handshake (must never hang combat)
 
 ```
-(anyone) RollRequest ─▶ core resolves ─▶ RollResolved { id, total, is_nat20, is_nat1 }
-                                                  │
-                       dice::enqueue_resolved pushes an animation job
-                                                  │
-                       dice::run_theater spawns a d20 sprite, tumbles it,
-                       and LANDS it on `total` (never recomputed here)
-                                                  │
-                       on is_nat20 → golden particle burst + warm flash
-                       on is_nat1  → red shards + screen dim + camera shake
-                                                  │
-                       when the animation + flourish finish:
-                       RollAnimationComplete { id }  ── fired once, same id
-                                                  │
-                       core applies the roll's consequences (damage, death, …)
+(anyone) RollRequest ─▶ core resolves (difficulty-aware) ─▶ RollResolved { id, total, is_nat20, is_nat1 }
+                                                                   │
+                              dice::enqueue_resolved pushes one animation job per event
+                                                                   │
+                              dice::run_theater spawns a d20 at world-centre, tumbles it,
+                              and LANDS on `total` (never recomputed); plays nat-20 / nat-1
+                              flourishes from the event's flags
+                                                                   │
+                              at the end of every job it ALWAYS fires:
+                              RollAnimationComplete { id }   ── exactly once, same id
+                                                                   │
+                              core applies the consequences (damage / death / encounter end)
 ```
 
-We are **never authoritative**: `core` decides the result; we animate toward it.
-The nat-20 / nat-1 effects are cosmetic reactions to the event's flags.
+Guarantees:
 
-Rendering uses plain `bevy` sprites + `Text2d` and a sprite-based particle
-fallback (the blueprint's permitted alternative to `bevy_hanabi`), so the theater
-carries no version-sensitive particle/tweening dependency.
+* **Never authoritative** — the die animates toward whatever core decided,
+  including Easy-mode skew and Codex's "force nat-20/nat-1" debug option (we only
+  read `total` / `is_nat20` / `is_nat1`).
+* **No desync under rapid rolls** — jobs are a FIFO queue, animated one at a
+  time; each `RollResolved.id` produces exactly one `RollAnimationComplete.id`.
+  Character-creation fires six ability rolls at once: they queue and complete in
+  order.
+* **Cannot hang** — `run_theater` advances on `Time` every `Update` frame
+  regardless of rendering or game state, so completion always fires. The die sits
+  at world-centre, which the encounter layout leaves uncovered.
 
-The theater die is drawn at world-centre. It is fully visible during encounters
-(the centre of the screen is intentionally left uncovered there). During
-character-creation ability rolls the same roll → resolve → complete flow runs and
-the generated scores appear as chips; the centred die may sit behind the creation
-panel.
+Rendering is hand-rolled `bevy` sprites + `Text2d` + a sprite-particle fallback
+(no version-sensitive particle/tweening dependency).
 
-## How combat is wired (without touching core)
+## Debug overlay (F1)
 
-`core` resolves rolls and, given a `PendingRolls` entry, applies damage after
-`RollAnimationComplete`. The UI supplies the glue using only public APIs:
-
-1. The action bar fires `RollRequest`(Attack) and records the in-flight attack.
-2. `hud::register_pending_attacks` reads the authoritative `RollResolved` and
-   writes a `PendingAttack` into `core`'s `PendingRolls`.
-3. The Dice Theater animates and fires `RollAnimationComplete`.
-4. `core` applies the damage; `hud::advance_turn_on_complete` moves the turn on.
-
-Initiative works the same way: `EncounterStarted` ⇒ one `RollRequest`(Initiative)
-per combatant ⇒ `hud::collect_initiative_rolls` builds the turn order from the
-results via `core::build_turn_order`.
+`debug::debug_overlay_ui` shows the current state, the last roll core resolved
+(raw dice + final skewed total + nat flags), the active combatant, and
+party/enemy resources + gold. Read-only; it never drives the game.
 
 ## Notes for the integrator
 
-* **Camera**: the blueprint assigns the 2D camera to `starwood_render`, which is
-  still a stub. `setup_ui_camera` spawns one only if none exists, so egui and the
-  dice sprites render today; once `render` spawns its own camera this becomes a
-  no-op.
-* **Item icons**: real 32×32 item sprites belong to `starwood_render`. Until it
-  exposes textures, the inventory shows lettered tiles. Swapping to `egui::Image`
-  later needs no structural change.
-* Requests for core/contract changes are in `NEEDS_FROM_CORE.md`. No new shared
-  workspace dependencies were needed (`WORKSPACE_DEPS_TODO.md` is unchanged).
+* **Camera** is spawned by the UI only if none exists (render is still a stub).
+* **Item icons**: the inventory shows rarity-framed name tiles; real 32×32 item
+  sprites belong to `starwood_render` (swap to `egui::Image` later, no structural
+  change).
+* Core clears the encounter enemy list but does not despawn the enemy entities
+  (its death handler skips non-party units), so `hud::despawn_stale_enemies`
+  tidies the stage on entering Exploration. Noted in `NEEDS_FROM_CORE.md`.

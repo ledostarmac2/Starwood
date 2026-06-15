@@ -1,17 +1,13 @@
-//! Persistent HUD (party panel + equipped-gear readout), the Exploration map,
-//! the encounter turn order and the action bar — plus the small flow systems
-//! that turn action-bar clicks into the contract's roll/encounter events and
-//! keep the turn order moving.
+//! Persistent HUD, the Exploration map, and the encounter combat UI.
 //!
-//! The egui front-end is split into three systems (party panel, exploration,
-//! encounter) to stay under Bevy's system-parameter limit and to keep each
-//! screen's data needs obvious.
+//! Combat is **message-driven**: the UI fires `CombatActionRequest` /
+//! `SurrenderRequested` / `ConsumableUseRequested`; core builds the attack roll,
+//! resolves it (difficulty-aware), and — after the Dice Theater fires
+//! `RollAnimationComplete` — applies damage and detects death / encounter end.
 //!
-//! Combat correctness lives in `starwood_core`: we only ever *request* rolls and
-//! forward their authoritative results into `core`'s `PendingRolls` so that
-//! `core` applies damage after the Dice Theater fires `RollAnimationComplete`.
-
-use std::collections::{HashMap, HashSet};
+//! Core does *not* move `ActiveTurn`, so the one combat job the UI owns is
+//! **turn advancement**: after an action resolves (a roll completes, or a no-roll
+//! action ends the turn) we move `ActiveTurn` to the next living combatant.
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
@@ -19,61 +15,27 @@ use starwood_core::*;
 
 use crate::theme;
 
-/// Player-side selections that several panels share.
+/// Player-side selections + which overlay windows are open.
 #[derive(Resource, Default)]
-pub struct UiSelection {
+pub struct UiState {
     pub selected_member: Option<Entity>,
     pub target_enemy: Option<Entity>,
     pub show_sheet: bool,
     pub show_skills: bool,
+    pub show_talents: bool,
 }
 
-/// In-flight attack we have requested but whose result has not yet resolved.
-#[derive(Clone)]
-pub struct InFlightAttack {
-    pub attacker: Entity,
-    pub target: Entity,
-    pub damage: DiceExpr,
-}
-
-/// UI-side bookkeeping for the encounter loop. Resolution still happens in core.
+/// UI-side combat bookkeeping (core owns resolution).
 #[derive(Resource, Default)]
 pub struct CombatFlow {
-    pub started: bool,
-    pub init_pending: HashMap<u64, Entity>,
-    pub init_results: Vec<(Entity, i32)>,
-    pub init_expected: usize,
-    pub attacks: HashMap<u64, InFlightAttack>,
-    pub advance_ids: HashSet<u64>,
+    /// An attack is mid-flight; advance the turn when its roll animation ends.
     pub pending_actor: Option<Entity>,
-    pub fled: bool,
-    pub next_id: u64,
-}
-
-impl CombatFlow {
-    fn alloc_id(&mut self) -> u64 {
-        if self.next_id < 1_000_000 {
-            self.next_id = 1_000_000;
-        }
-        self.next_id += 1;
-        self.next_id
-    }
-
-    fn reset_for_new_encounter(&mut self) {
-        self.started = false;
-        self.init_pending.clear();
-        self.init_results.clear();
-        self.init_expected = 0;
-        self.attacks.clear();
-        self.advance_ids.clear();
-        self.pending_actor = None;
-        self.fled = false;
-    }
+    /// A no-roll action (item/move-as-action) asked to end the turn next frame.
+    pub end_turn_now: bool,
 }
 
 // ===== Query aliases ===============================================
 
-/// Read-only party view used by the always-on party panel.
 type PartyView<'w, 's> = Query<
     'w,
     's,
@@ -81,25 +43,26 @@ type PartyView<'w, 's> = Query<
         Entity,
         &'static Character,
         &'static Health,
+        Option<&'static Mana>,
         &'static Derived,
         &'static Equipment,
         &'static PartyMember,
+        Option<&'static PlayerCharacter>,
+        Option<&'static Downed>,
     ),
     Without<EnemyUnit>,
 >;
 
-/// Mutable party view used inside an encounter (attack reads + heal writes).
 type PartyCombat<'w, 's> = Query<
     'w,
     's,
     (
         Entity,
         &'static Character,
-        &'static mut Health,
-        &'static Derived,
+        &'static Health,
+        Option<&'static mut Mana>,
         &'static Equipment,
-        &'static Abilities,
-        &'static PartyMember,
+        &'static mut PartyMember,
     ),
     Without<EnemyUnit>,
 >;
@@ -124,11 +87,10 @@ pub fn party_panel_ui(
     mut inventory_open: ResMut<InventoryOpen>,
     party: PartyView,
     active: Query<Entity, With<ActiveTurn>>,
-    mana_view: Query<(&Mana, Option<&Cooldowns>)>,
-    mut selection: ResMut<UiSelection>,
-    data: Res<GameData>,
-    instances: Res<ItemInstances>,
+    mut ui_state: ResMut<UiState>,
     gold: Res<Gold>,
+    data: Res<GameData>,
+    mut revive: EventWriter<ReviveAttempt>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let in_encounter = *game_state.get() == GameState::Encounter;
@@ -136,30 +98,44 @@ pub fn party_panel_ui(
 
     egui::SidePanel::left("party_panel")
         .resizable(false)
-        .min_width(252.0)
+        .min_width(264.0)
         .frame(theme::panel_frame())
         .show(ctx, |ui| {
-            ui.label(theme::heading("Your Party"));
-            ui.label(theme::flavour(format!("Gold: {}", gold.0)));
+            ui.horizontal(|ui| {
+                ui.label(theme::heading("Your Party"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("⦿ {} gold", gold.0))
+                            .color(theme::GOLD_BRIGHT)
+                            .strong(),
+                    );
+                });
+            });
             ui.separator();
 
             let mut members: Vec<_> = party.iter().collect();
-            members.sort_by_key(|(.., member)| member.slot);
-            for (entity, character, health, derived, equipment, _member) in members {
+            members.sort_by_key(|(.., member, _, _)| member.slot);
+            for (entity, character, health, mana, derived, _equipment, member, pc, downed) in
+                members
+            {
                 let is_active = Some(entity) == active_entity;
-                let selected = selection.selected_member == Some(entity);
+                let selected = ui_state.selected_member == Some(entity);
                 theme::card_frame(is_active).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let title = egui::RichText::new(character.name.as_str())
+                        let title_color = if downed.is_some() {
+                            theme::BLOOD
+                        } else if is_active {
+                            theme::GOLD_BRIGHT
+                        } else {
+                            theme::INK
+                        };
+                        let mark = if pc.is_some() { "★ " } else { "" };
+                        let title = egui::RichText::new(format!("{mark}{}", character.name))
                             .size(16.0)
-                            .color(if is_active {
-                                theme::GOLD_BRIGHT
-                            } else {
-                                theme::INK
-                            })
+                            .color(title_color)
                             .strong();
                         if ui.selectable_label(selected, title).clicked() {
-                            selection.selected_member = Some(entity);
+                            ui_state.selected_member = Some(entity);
                         }
                         if is_active && in_encounter {
                             ui.label(
@@ -170,40 +146,51 @@ pub fn party_panel_ui(
                         }
                     });
                     ui.label(theme::flavour(format!(
-                        "L{} {}  ·  AC {}",
+                        "rank {}  ·  L{} {}  ·  AC {}",
+                        member.slot,
                         character.level,
                         class_name(&character.class, &data),
                         derived.armor_class
                     )));
                     hp_bar(ui, health.current, health.max);
-                    if let Ok((mana, cooldowns)) = mana_view.get(entity) {
-                        mana_bar(ui, mana.current, mana.max);
-                        if let Some(cooldowns) = cooldowns {
-                            cooldown_line(ui, cooldowns);
+                    if let Some(mana) = mana {
+                        if mana.max > 0 {
+                            mana_bar(ui, mana.current, mana.max);
                         }
                     }
-                    ui.label(theme::flavour(format!(
-                        "Gear: {}",
-                        equipped_line(equipment, &data, &instances)
-                    )));
+                    if downed.is_some() {
+                        let cost = REVIVE_GOLD_COST_BASE;
+                        if ui
+                            .add_enabled(
+                                gold.0 >= cost,
+                                egui::Button::new(format!("Revive ({cost}g)")),
+                            )
+                            .clicked()
+                        {
+                            revive.write(ReviveAttempt { entity });
+                        }
+                    }
                 });
             }
 
             ui.add_space(8.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Inventory").clicked() {
                     inventory_open.0 = !inventory_open.0;
                 }
-                if ui.button("Character Sheet").clicked() {
-                    selection.show_sheet = !selection.show_sheet;
+                if ui.button("Sheet").clicked() {
+                    ui_state.show_sheet = !ui_state.show_sheet;
                 }
                 if ui.button("Skills").clicked() {
-                    selection.show_skills = !selection.show_skills;
+                    ui_state.show_skills = !ui_state.show_skills;
+                }
+                if ui.button("Talents").clicked() {
+                    ui_state.show_talents = !ui_state.show_talents;
                 }
             });
 
-            if selection.selected_member.is_none() {
-                selection.selected_member =
+            if ui_state.selected_member.is_none() {
+                ui_state.selected_member =
                     active_entity.or_else(|| party.iter().next().map(|t| t.0));
             }
         });
@@ -213,36 +200,30 @@ pub fn party_panel_ui(
 
 // ===== Exploration map =============================================
 
-#[allow(clippy::too_many_arguments)]
 pub fn exploration_ui(
     mut contexts: EguiContexts,
     party: Query<&Character, With<PartyMember>>,
     mut map: ResMut<MapState>,
     data: Res<GameData>,
-    difficulty: Res<GameDifficulty>,
-    tuning: Res<DifficultyTuning>,
     mut rng: ResMut<GameRng>,
-    mut encounter: ResMut<EncounterState>,
-    mut combat: ResMut<CombatFlow>,
-    mut commands: Commands,
-    mut started: EventWriter<EncounterStarted>,
-    mut next_game: ResMut<NextState<GameState>>,
-    mut inventory: ResMut<crate::inventory::PartyInventory>,
+    mut inventory: ResMut<Inventory>,
+    mut instances: ResMut<ItemInstances>,
+    mut gold: ResMut<Gold>,
+    mut shop: ResMut<crate::inventory::ShopStock>,
+    antagonist: Res<Antagonist>,
+    mut encounter_req: EventWriter<EncounterRequested>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let party_level = party.iter().map(|c| c.level).max().unwrap_or(1);
 
     egui::CentralPanel::default()
-        .frame(
-            egui::Frame::new()
-                .fill(theme::BG_DEEP)
-                .inner_margin(egui::Margin::same(16)),
-        )
+        .frame(egui::Frame::new().fill(theme::BG_DEEP).inner_margin(egui::Margin::same(16)))
         .show(ctx, |ui| {
             ui.label(theme::title("The Starwood"));
-            ui.label(theme::flavour(
-                "Choose your path. Each road forward is a choice you cannot unmake.",
-            ));
+            ui.label(theme::flavour(format!(
+                "{} — a {} who would {}.",
+                antagonist.identity, antagonist.role, antagonist.purpose
+            )));
             ui.add_space(10.0);
 
             if map.nodes.is_empty() {
@@ -265,44 +246,27 @@ pub fn exploration_ui(
                         let is_current = current == Some(node.id);
                         let is_reachable = reachable.contains(&node.id);
                         let (glyph, color) = node_glyph(node.node_type, node.completed, is_current);
-                        let button =
-                            egui::Button::new(egui::RichText::new(glyph).size(16.0).color(color))
-                                .min_size(egui::vec2(118.0, 34.0))
-                                .fill(if is_current {
-                                    theme::PANEL_LIGHT
-                                } else {
-                                    theme::PANEL
-                                });
-                        let response = ui.add_enabled(is_reachable, button);
-                        if response.on_hover_text(node_hint(node.node_type)).clicked() {
+                        let button = egui::Button::new(egui::RichText::new(glyph).size(15.0).color(color))
+                            .min_size(egui::vec2(120.0, 32.0))
+                            .fill(if is_current { theme::PANEL_LIGHT } else { theme::PANEL });
+                        if ui.add_enabled(is_reachable, button).on_hover_text(node_hint(node.node_type)).clicked() {
                             clicked = Some(node.id);
                         }
                     }
                 });
-                ui.add_space(4.0);
+                ui.add_space(3.0);
             }
 
-            ui.add_space(12.0);
+            ui.add_space(10.0);
             ui.separator();
             ui.label(theme::flavour(
-                "◆ combat   ◈ elite   ✦ treasure   ❂ event   ☾ rest   ☠ boss   ✓ cleared",
+                "◆ combat  ◈ elite  ✦ treasure  ❂ event  ☾ rest  ⌂ town  ⚖ shop  ☠ boss  ✪ quest  ✓ cleared",
             ));
 
             if let Some(node_id) = clicked {
                 enter_node(
-                    node_id,
-                    &mut map,
-                    party_level,
-                    &data,
-                    &mut rng,
-                    &mut encounter,
-                    &mut combat,
-                    &mut commands,
-                    &mut started,
-                    &mut next_game,
-                    &mut inventory,
-                    difficulty.0,
-                    *tuning,
+                    node_id, &mut map, party_level, &data, &mut rng, &mut inventory, &mut instances,
+                    &mut gold, &mut shop, &mut encounter_req,
                 );
             }
         });
@@ -310,21 +274,17 @@ pub fn exploration_ui(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn enter_node(
     node_id: u32,
     map: &mut MapState,
     party_level: u32,
     data: &GameData,
     rng: &mut GameRng,
-    encounter: &mut EncounterState,
-    combat: &mut CombatFlow,
-    commands: &mut Commands,
-    started: &mut EventWriter<EncounterStarted>,
-    next_game: &mut NextState<GameState>,
-    inventory: &mut crate::inventory::PartyInventory,
-    difficulty: Difficulty,
-    tuning: DifficultyTuning,
+    inventory: &mut Inventory,
+    instances: &mut ItemInstances,
+    gold: &mut Gold,
+    shop: &mut crate::inventory::ShopStock,
+    encounter_req: &mut EventWriter<EncounterRequested>,
 ) {
     if let Some(from) = map.current_node {
         if let Some(node) = map.nodes.iter_mut().find(|n| n.id == from) {
@@ -332,7 +292,6 @@ fn enter_node(
         }
     }
     map.current_node = Some(node_id);
-
     let Some(node_type) = map
         .nodes
         .iter()
@@ -343,70 +302,57 @@ fn enter_node(
     };
 
     match node_type {
-        MapNodeType::Combat | MapNodeType::Elite | MapNodeType::Boss => {
-            let enemy_ids = choose_enemy_archetypes(data, party_level, node_type, &mut rng.0);
-            combat.reset_for_new_encounter();
-            begin_encounter(
-                commands, data, &enemy_ids, encounter, started, difficulty, tuning,
-            );
-            next_game.set(GameState::Encounter);
-        }
-        MapNodeType::BonusQuest => {
-            let enemy_ids =
-                choose_enemy_archetypes(data, party_level.max(10), MapNodeType::Boss, &mut rng.0);
-            combat.reset_for_new_encounter();
-            begin_encounter(
-                commands, data, &enemy_ids, encounter, started, difficulty, tuning,
-            );
-            next_game.set(GameState::Encounter);
+        MapNodeType::Combat | MapNodeType::Elite | MapNodeType::Boss | MapNodeType::BonusQuest => {
+            // Core spawns enemies, rolls initiative, and switches to Encounter.
+            encounter_req.write(EncounterRequested {
+                difficulty: node_type,
+            });
         }
         MapNodeType::Treasure => {
-            inventory
-                .items
-                .extend(choose_loot(data, party_level, &mut rng.0));
-            mark_current_completed(map);
+            for id in roll_loot_instances(data, party_level, instances, &mut rng.0) {
+                let _ = add_item_to_inventory(inventory, id);
+            }
+            mark_completed(map, node_id);
         }
-        MapNodeType::Town | MapNodeType::Shop => {
-            inventory.shop_open = matches!(node_type, MapNodeType::Shop);
-            mark_current_completed(map);
-        }
-        MapNodeType::Rest => {
-            inventory.rest_requested = true;
-            mark_current_completed(map);
+        MapNodeType::Shop | MapNodeType::Town => {
+            shop.items =
+                crate::inventory::roll_shop_stock(data, instances, &mut rng.0, party_level, 6);
+            shop.open = true;
+            mark_completed(map, node_id);
         }
         MapNodeType::Event => {
-            inventory.items.push("healing_draught".to_string());
-            mark_current_completed(map);
+            // A small choose-your-path boon: a purse of gold scaled to depth.
+            gold.0 = gold.0.saturating_add(20 + party_level * 10);
+            mark_completed(map, node_id);
+        }
+        MapNodeType::Rest => {
+            mark_completed(map, node_id);
         }
     }
 }
 
-fn mark_current_completed(map: &mut MapState) {
-    if let Some(id) = map.current_node {
-        if let Some(node) = map.nodes.iter_mut().find(|n| n.id == id) {
-            node.completed = true;
-        }
+fn mark_completed(map: &mut MapState, node_id: u32) {
+    if let Some(node) = map.nodes.iter_mut().find(|n| n.id == node_id) {
+        node.completed = true;
     }
 }
 
 // ===== Encounter (turn order, foes, action bar) ====================
 
-#[allow(clippy::too_many_arguments)]
 pub fn encounter_ui(
     mut contexts: EguiContexts,
     mut party: PartyCombat,
     enemies: EnemyQuery,
     active: Query<Entity, With<ActiveTurn>>,
-    mana_view: Query<(&Mana, Option<&Cooldowns>)>,
-    mut selection: ResMut<UiSelection>,
+    mut ui_state: ResMut<UiState>,
     mut combat: ResMut<CombatFlow>,
-    mut encounter: ResMut<EncounterState>,
-    mut inventory: ResMut<crate::inventory::PartyInventory>,
+    encounter: Res<EncounterState>,
     data: Res<GameData>,
     instances: Res<ItemInstances>,
-    mut commands: Commands,
-    mut rolls: EventWriter<RollRequest>,
+    inventory: Res<Inventory>,
+    mut action_req: EventWriter<CombatActionRequest>,
     mut surrender: EventWriter<SurrenderRequested>,
+    mut consume: EventWriter<ConsumableUseRequested>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let active_entity = active.iter().next();
@@ -418,9 +364,6 @@ pub fn encounter_ui(
             ui.horizontal_wrapped(|ui| {
                 ui.label(theme::heading("Initiative"));
                 ui.add_space(8.0);
-                if encounter.turn_order.is_empty() {
-                    ui.label(theme::flavour("rolling for initiative…"));
-                }
                 for entity in &encounter.turn_order {
                     let active_now = Some(*entity) == active_entity;
                     let name = combatant_name(*entity, &party, &enemies, &data);
@@ -435,32 +378,58 @@ pub fn encounter_ui(
             });
         });
 
-    // Foes (right).
+    // Active actor reach (for rank-valid targeting).
+    let actor = active_entity.filter(|e| party.get(*e).is_ok());
+    let (actor_rank, actor_reach) = actor
+        .and_then(|e| party.get(e).ok())
+        .map(|(_, _, _, _, equipment, member)| {
+            (member.slot, weapon_reach(equipment, &instances, &data))
+        })
+        .unwrap_or((0, Reach::Melee));
+
+    // The frontmost living foe is always targetable so a melee party can never
+    // soft-lock once the front rank dies (core does not rank-collapse enemies).
+    let front_rank = enemies
+        .iter()
+        .filter(|(_, _, h, _)| h.current > 0)
+        .map(|(_, unit, _, _)| unit.slot)
+        .min();
+
+    // Foes (right) — reachable or frontmost living foes are selectable.
     egui::SidePanel::right("enemy_panel")
         .resizable(false)
-        .min_width(230.0)
+        .min_width(238.0)
         .frame(theme::panel_frame())
         .show(ctx, |ui| {
             ui.label(theme::heading("Foes"));
             ui.separator();
             let mut foes: Vec<_> = enemies.iter().collect();
             foes.sort_by_key(|(.., unit, _, _)| unit.slot);
-            for (entity, unit, health, _derived) in foes {
+            for (entity, unit, health, _) in foes {
                 if health.current <= 0 {
                     continue;
                 }
-                let targeted = selection.target_enemy == Some(entity);
+                let reachable = can_reach_rank(Rank(actor_rank), Rank(unit.slot), actor_reach)
+                    || Some(unit.slot) == front_rank;
+                let targeted = ui_state.target_enemy == Some(entity);
                 theme::card_frame(targeted).show(ui, |ui| {
+                    let label = egui::RichText::new(format!(
+                        "R{} {}",
+                        unit.slot,
+                        enemy_name(&unit.archetype, &data)
+                    ))
+                    .size(15.0)
+                    .strong()
+                    .color(if reachable {
+                        theme::INK
+                    } else {
+                        theme::INK_DIM
+                    });
                     if ui
-                        .selectable_label(
-                            targeted,
-                            egui::RichText::new(enemy_name(&unit.archetype, &data))
-                                .size(15.0)
-                                .strong(),
-                        )
+                        .add_enabled(reachable, egui::Button::selectable(targeted, label))
                         .clicked()
                     {
-                        selection.target_enemy = Some(entity);
+                        ui_state.target_enemy = Some(entity);
                     }
                     hp_bar(ui, health.current, health.max);
                 });
@@ -471,111 +440,114 @@ pub fn encounter_ui(
     egui::TopBottomPanel::bottom("action_bar")
         .frame(theme::hero_frame())
         .show(ctx, |ui| {
-            let active_party = active_entity.filter(|e| party.get(*e).is_ok());
-            let locked = combat.pending_actor.is_some();
-
-            let Some(actor) = active_party else {
+            let Some(actor) = actor else {
                 ui.horizontal(|ui| {
                     ui.label(theme::heading("Foe's turn"));
                     ui.label(theme::flavour("the enemy moves against you…"));
                 });
                 return;
             };
+            let locked = combat.pending_actor.is_some();
 
-            // Keep a valid, living target selected.
-            let target_invalid = selection
-                .target_enemy
-                .map(|t| {
-                    enemies
-                        .get(t)
-                        .map(|(.., h, _)| h.current <= 0)
-                        .unwrap_or(true)
-                })
-                .unwrap_or(true);
-            if target_invalid {
-                selection.target_enemy = enemies
+            // Validate / default the target to a reachable, living foe.
+            let can_target = |slot: u8, current: i32| {
+                current > 0
+                    && (can_reach_rank(Rank(actor_rank), Rank(slot), actor_reach)
+                        || Some(slot) == front_rank)
+            };
+            let target_valid = ui_state.target_enemy.is_some_and(|t| {
+                enemies
+                    .get(t)
+                    .map(|(_, unit, h, _)| can_target(unit.slot, h.current))
+                    .unwrap_or(false)
+            });
+            if !target_valid {
+                ui_state.target_enemy = enemies
                     .iter()
-                    .find(|(.., h, _)| h.current > 0)
+                    .filter(|(_, unit, h, _)| can_target(unit.slot, h.current))
+                    .min_by_key(|(_, unit, _, _)| unit.slot)
                     .map(|(e, ..)| e);
             }
-            let target = selection.target_enemy;
+            let target = ui_state.target_enemy;
             let has_target = target.is_some();
-            let has_potion = inventory.items.iter().any(|i| i == "healing_draught");
 
-            ui.horizontal(|ui| {
+            // Mana available for a Cast?
+            let mana_left = party
+                .get(actor)
+                .ok()
+                .and_then(|(_, _, _, mana, _, _)| mana.map(|m| m.current))
+                .unwrap_or(0);
+            let potion = find_potion(&inventory, &instances, &data);
+
+            ui.horizontal_wrapped(|ui| {
                 ui.label(theme::heading("Your move"));
                 ui.add_space(8.0);
-                if let Ok((mana, cooldowns)) = mana_view.get(actor) {
-                    ui.label(theme::flavour(format!(
-                        "{}/{} mana",
-                        mana.current, mana.max
-                    )));
-                    if let Some(cooldowns) = cooldowns {
-                        let active_cooldowns = cooldowns
-                            .abilities
-                            .iter()
-                            .filter(|ability| ability.remaining > 0)
-                            .count();
-                        if active_cooldowns > 0 {
-                            ui.label(theme::flavour(format!("{active_cooldowns} cooling")));
-                        }
-                    }
-                }
+
                 if ui
                     .add_enabled(!locked && has_target, action_button("⚔ Attack"))
                     .clicked()
                 {
                     if let Some(target) = target {
-                        request_attack(
+                        action_req.write(CombatActionRequest {
                             actor,
                             target,
-                            AttackKind::Weapon,
-                            &party,
-                            &data,
-                            &instances,
-                            &mut combat,
-                            &mut rolls,
-                        );
+                            action: CombatAction::Attack,
+                        });
+                        combat.pending_actor = Some(actor);
                     }
                 }
                 if ui
-                    .add_enabled(!locked && has_target, action_button("✦ Cast"))
+                    .add_enabled(
+                        !locked && has_target && mana_left >= 2,
+                        action_button("✦ Cast"),
+                    )
                     .clicked()
                 {
                     if let Some(target) = target {
-                        request_attack(
+                        if let Ok((_, _, _, Some(mut mana), _, _)) = party.get_mut(actor) {
+                            mana.current = (mana.current - 2).max(0);
+                        }
+                        action_req.write(CombatActionRequest {
                             actor,
                             target,
-                            AttackKind::Spell,
-                            &party,
-                            &data,
-                            &instances,
-                            &mut combat,
-                            &mut rolls,
-                        );
+                            action: CombatAction::Attack,
+                        });
+                        combat.pending_actor = Some(actor);
+                    }
+                }
+                if ui.add_enabled(!locked, action_button("⇄ Move")).clicked() {
+                    rank_swap_forward(actor, &mut party);
+                }
+                if ui
+                    .add_enabled(!locked && potion.is_some(), action_button("🜂 Potion"))
+                    .clicked()
+                {
+                    if let Some(item) = potion {
+                        consume.write(ConsumableUseRequested { actor, item });
+                        combat.end_turn_now = true;
                     }
                 }
                 if ui
-                    .add_enabled(!locked && has_potion, action_button("🜂 Use Item"))
+                    .add_enabled(!locked, action_button("🏳 Surrender"))
                     .clicked()
                 {
-                    use_healing_draught(
-                        actor,
-                        &mut party,
-                        &mut inventory,
-                        &mut combat,
-                        &mut commands,
-                        &mut encounter,
-                    );
-                }
-                if ui
-                    .add_enabled(!locked, action_button("Surrender"))
-                    .clicked()
-                {
-                    combat.fled = true;
                     surrender.write(SurrenderRequested { actor });
                 }
             });
+
+            // AoE friendly-fire awareness for the current target's rank.
+            if let Some(target) = target {
+                if let Ok((_, unit, _, _)) = enemies.get(target) {
+                    let targets = rank_targets(&party, &enemies);
+                    if aoe_friendly_fire_risk(&targets, CombatSide::Party, Rank(unit.slot), 1) {
+                        ui.label(
+                            egui::RichText::new("⚠ An AoE at this rank could catch your own.")
+                                .color(theme::BLOOD)
+                                .size(12.0),
+                        );
+                    }
+                }
+            }
             if locked {
                 ui.label(theme::flavour("the dice decide…"));
             }
@@ -584,217 +556,56 @@ pub fn encounter_ui(
     Ok(())
 }
 
-// ===== Action helpers ==============================================
-
-#[derive(Clone, Copy)]
-enum AttackKind {
-    Weapon,
-    Spell,
-}
-
-fn request_attack(
-    attacker: Entity,
-    target: Entity,
-    kind: AttackKind,
-    party: &PartyCombat,
-    data: &GameData,
-    instances: &ItemInstances,
-    combat: &mut CombatFlow,
-    rolls: &mut EventWriter<RollRequest>,
-) {
-    let Ok((_, _, _, derived, equipment, abilities, _)) = party.get(attacker) else {
+/// Swap the active member one rank forward (toward the front) with a neighbour.
+fn rank_swap_forward(actor: Entity, party: &mut PartyCombat) {
+    let mut roster: Vec<(Entity, u8)> =
+        party.iter().map(|(e, _, _, _, _, m)| (e, m.slot)).collect();
+    roster.sort_by_key(|(_, slot)| *slot);
+    let Some(pos) = roster.iter().position(|(e, _)| *e == actor) else {
         return;
     };
-
-    let attack_mod = match kind {
-        AttackKind::Weapon => {
-            derived.proficiency
-                + ability_modifier(abilities.str_).max(ability_modifier(abilities.dex))
-        }
-        AttackKind::Spell => {
-            derived.proficiency
-                + ability_modifier(abilities.int).max(ability_modifier(abilities.cha))
-        }
-    };
-    let damage = match kind {
-        AttackKind::Weapon => equipment
-            .main_hand
-            .as_ref()
-            .and_then(|id| base_item_for_instance(id, data, instances))
-            .and_then(|item| item.damage.clone())
-            .unwrap_or(DiceExpr {
-                count: 1,
-                sides: 4,
-                modifier: 0,
-            }),
-        AttackKind::Spell => DiceExpr {
-            count: 1,
-            sides: 8,
-            modifier: 0,
-        },
-    };
-
-    let id = combat.alloc_id();
-    rolls.write(RollRequest {
-        id,
-        expr: DiceExpr {
-            count: 1,
-            sides: 20,
-            modifier: attack_mod,
-        },
-        kind: RollKind::Attack,
-        source: Some(attacker),
-        advantage: AdvState::Normal,
-    });
-    combat.attacks.insert(
-        id,
-        InFlightAttack {
-            attacker,
-            target,
-            damage,
-        },
-    );
-    combat.pending_actor = Some(attacker);
-}
-
-fn use_healing_draught(
-    actor: Entity,
-    party: &mut PartyCombat,
-    inventory: &mut crate::inventory::PartyInventory,
-    combat: &mut CombatFlow,
-    commands: &mut Commands,
-    encounter: &mut EncounterState,
-) {
-    if let Some(pos) = inventory.items.iter().position(|i| i == "healing_draught") {
-        inventory.items.remove(pos);
+    // Prefer swapping with the member just ahead; otherwise just behind.
+    let other = if pos > 0 {
+        roster.get(pos - 1)
     } else {
+        roster.get(pos + 1)
+    };
+    let Some(&(other_entity, other_slot)) = other else {
         return;
+    };
+    let actor_slot = roster[pos].1;
+    if let Ok((.., mut member)) = party.get_mut(actor) {
+        member.slot = other_slot;
     }
-    if let Ok((_, _, mut health, _, _, _, _)) = party.get_mut(actor) {
-        health.current = (health.current + 8).min(health.max);
-    }
-    advance_turn_now(commands, encounter);
-    combat.pending_actor = None;
-}
-
-// ===== Flow systems (Update) =======================================
-
-pub fn handle_encounter_started(
-    mut events: EventReader<EncounterStarted>,
-    roster: Res<PartyRoster>,
-    combatants: Query<(&Derived, &Health)>,
-    mut combat: ResMut<CombatFlow>,
-    mut rolls: EventWriter<RollRequest>,
-) {
-    for event in events.read() {
-        combat.reset_for_new_encounter();
-        combat.started = true;
-
-        let all = roster
-            .members
-            .iter()
-            .copied()
-            .chain(event.enemies.iter().copied());
-        for entity in all {
-            let Ok((derived, health)) = combatants.get(entity) else {
-                continue;
-            };
-            if health.current <= 0 {
-                continue;
-            }
-            let id = combat.alloc_id();
-            combat.init_pending.insert(id, entity);
-            combat.init_expected += 1;
-            rolls.write(RollRequest {
-                id,
-                expr: DiceExpr {
-                    count: 1,
-                    sides: 20,
-                    modifier: derived.initiative_mod,
-                },
-                kind: RollKind::Initiative,
-                source: Some(entity),
-                advantage: AdvState::Normal,
-            });
-        }
+    if let Ok((.., mut member)) = party.get_mut(other_entity) {
+        member.slot = actor_slot;
     }
 }
 
-pub fn collect_initiative_rolls(
-    mut resolved: EventReader<RollResolved>,
-    mut combat: ResMut<CombatFlow>,
-    mut encounter: ResMut<EncounterState>,
-    mut commands: Commands,
-) {
-    for event in resolved.read() {
-        if event.kind != RollKind::Initiative {
-            continue;
-        }
-        if let Some(entity) = combat.init_pending.remove(&event.id) {
-            combat.init_results.push((entity, event.total));
-        }
-    }
+// ===== Flow systems (Update, Encounter) ============================
 
-    if combat.init_expected > 0 && combat.init_results.len() >= combat.init_expected {
-        let initiatives = std::mem::take(&mut combat.init_results);
-        let order: Vec<Entity> = initiatives.iter().map(|(e, _)| *e).collect();
-        build_turn_order(&mut commands, &order, &initiatives, &mut encounter);
-        combat.init_expected = 0;
+/// Despawn leftover foe entities when we return to Exploration. Core clears the
+/// encounter's enemy list but never despawns the entities (dead foes have no
+/// `PartyMember`/`PlayerCharacter`, so its death handler skips them), so we tidy
+/// the stage here. Safe because no encounter is active in Exploration.
+pub fn despawn_stale_enemies(mut commands: Commands, enemies: Query<Entity, With<EnemyUnit>>) {
+    for entity in &enemies {
+        commands.entity(entity).despawn();
     }
 }
 
-pub fn register_pending_attacks(
-    mut resolved: EventReader<RollResolved>,
-    mut combat: ResMut<CombatFlow>,
-    mut pending: ResMut<PendingRolls>,
-) {
-    for event in resolved.read() {
-        if let Some(attack) = combat.attacks.remove(&event.id) {
-            pending.attacks.insert(
-                event.id,
-                PendingAttack {
-                    attacker: attack.attacker,
-                    target: attack.target,
-                    attack_total: event.total,
-                    damage: attack.damage,
-                    is_crit: event.is_nat20,
-                },
-            );
-            combat.advance_ids.insert(event.id);
-        }
-    }
-}
-
-pub fn advance_turn_on_complete(
-    mut completed: EventReader<RollAnimationComplete>,
-    mut combat: ResMut<CombatFlow>,
-    mut encounter: ResMut<EncounterState>,
-    health: Query<&Health>,
-    mut commands: Commands,
-) {
-    for event in completed.read() {
-        if combat.advance_ids.remove(&event.id) {
-            combat.pending_actor = None;
-            advance_turn(&mut commands, &mut encounter, &health);
-        }
-    }
-}
-
+/// Drive enemy turns by firing an attack request against the first living PC.
 pub fn drive_enemy_turns(
     active_enemy: Query<(Entity, &EnemyUnit), With<ActiveTurn>>,
     roster: Res<PartyRoster>,
     health: Query<&Health>,
-    data: Res<GameData>,
     mut combat: ResMut<CombatFlow>,
-    mut rolls: EventWriter<RollRequest>,
+    mut action_req: EventWriter<CombatActionRequest>,
 ) {
     if combat.pending_actor.is_some() {
         return;
     }
-    let Ok((enemy, unit)) = active_enemy.single() else {
-        return;
-    };
-    let Some(archetype) = data.enemies.get(&unit.archetype) else {
+    let Ok((enemy, _)) = active_enemy.single() else {
         return;
     };
     let Some(target) = roster
@@ -805,91 +616,37 @@ pub fn drive_enemy_turns(
     else {
         return;
     };
-
-    let id = combat.alloc_id();
-    rolls.write(RollRequest {
-        id,
-        expr: DiceExpr {
-            count: 1,
-            sides: 20,
-            modifier: archetype.attack_bonus,
-        },
-        kind: RollKind::Attack,
-        source: Some(enemy),
-        advantage: AdvState::Normal,
+    action_req.write(CombatActionRequest {
+        actor: enemy,
+        target,
+        action: CombatAction::Attack,
     });
-    combat.attacks.insert(
-        id,
-        InFlightAttack {
-            attacker: enemy,
-            target,
-            damage: archetype.damage.clone(),
-        },
-    );
     combat.pending_actor = Some(enemy);
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn handle_encounter_ended(
-    mut events: EventReader<EncounterEnded>,
-    mut next_game: ResMut<NextState<GameState>>,
-    mut encounter: ResMut<EncounterState>,
+/// Advance the turn once an action resolves (a roll animation completed, or a
+/// no-roll action ended the turn). This is the only turn-mover in the game.
+pub fn advance_turn_after_action(
+    mut completed: EventReader<RollAnimationComplete>,
     mut combat: ResMut<CombatFlow>,
-    mut map: ResMut<MapState>,
-    mut inventory: ResMut<crate::inventory::PartyInventory>,
-    data: Res<GameData>,
-    mut rng: ResMut<GameRng>,
+    mut encounter: ResMut<EncounterState>,
+    health: Query<&Health>,
     mut commands: Commands,
 ) {
-    let mut handled = false;
-    for event in events.read() {
-        if handled || (encounter.enemies.is_empty() && !combat.fled) {
-            continue;
-        }
-        handled = true;
-        let fled = combat.fled;
-
-        for entity in encounter.turn_order.drain(..) {
-            commands.entity(entity).remove::<ActiveTurn>();
-        }
-        for entity in encounter.enemies.drain(..) {
-            commands.entity(entity).despawn();
-        }
-        encounter.turn_index = 0;
-        combat.reset_for_new_encounter();
-
-        if let Some(id) = map.current_node {
-            if let Some(node) = map.nodes.iter_mut().find(|n| n.id == id) {
-                node.completed = true;
-            }
-        }
-
-        if event.victory {
-            inventory.items.extend(choose_loot(&data, 1, &mut rng.0));
-            next_game.set(GameState::Exploration);
-        } else if fled {
-            next_game.set(GameState::Exploration);
-        } else {
-            next_game.set(GameState::GameOver);
-        }
+    let mut advance = false;
+    let roll_done = completed.read().count() > 0;
+    if roll_done && combat.pending_actor.is_some() {
+        combat.pending_actor = None;
+        advance = true;
+    }
+    if combat.end_turn_now {
+        combat.end_turn_now = false;
+        advance = true;
+    }
+    if advance {
+        advance_turn(&mut commands, &mut encounter, &health);
     }
 }
-
-/// Apply a Rest node's full heal to the whole party.
-pub fn apply_rest(
-    mut inventory: ResMut<crate::inventory::PartyInventory>,
-    mut party: Query<&mut Health, With<PartyMember>>,
-) {
-    if !inventory.rest_requested {
-        return;
-    }
-    inventory.rest_requested = false;
-    for mut health in &mut party {
-        health.current = health.max;
-    }
-}
-
-// ===== Turn-order helpers ==========================================
 
 fn advance_turn(commands: &mut Commands, encounter: &mut EncounterState, health: &Query<&Health>) {
     if encounter.turn_order.is_empty() {
@@ -914,20 +671,6 @@ fn advance_turn(commands: &mut Commands, encounter: &mut EncounterState, health:
     }
 }
 
-fn advance_turn_now(commands: &mut Commands, encounter: &mut EncounterState) {
-    if encounter.turn_order.is_empty() {
-        return;
-    }
-    if let Some(current) = encounter.turn_order.get(encounter.turn_index).copied() {
-        commands.entity(current).remove::<ActiveTurn>();
-    }
-    let count = encounter.turn_order.len();
-    encounter.turn_index = (encounter.turn_index + 1) % count;
-    commands
-        .entity(encounter.turn_order[encounter.turn_index])
-        .insert(ActiveTurn);
-}
-
 // ===== Small view helpers ==========================================
 
 fn hp_bar(ui: &mut egui::Ui, current: i32, max: i32) {
@@ -942,7 +685,7 @@ fn hp_bar(ui: &mut egui::Ui, current: i32, max: i32) {
     };
     ui.add(
         egui::ProgressBar::new(fraction)
-            .desired_width(200.0)
+            .desired_width(210.0)
             .fill(color)
             .corner_radius(egui::CornerRadius::same(3))
             .text(egui::RichText::new(format!("{}/{} HP", current.max(0), max)).size(12.0)),
@@ -950,29 +693,15 @@ fn hp_bar(ui: &mut egui::Ui, current: i32, max: i32) {
 }
 
 fn mana_bar(ui: &mut egui::Ui, current: i32, max: i32) {
-    if max <= 0 {
-        return;
-    }
+    let max = max.max(1);
     let fraction = (current.max(0) as f32 / max as f32).clamp(0.0, 1.0);
     ui.add(
         egui::ProgressBar::new(fraction)
-            .desired_width(200.0)
+            .desired_width(210.0)
             .fill(theme::ARCANE)
             .corner_radius(egui::CornerRadius::same(3))
-            .text(egui::RichText::new(format!("{}/{} Mana", current.max(0), max)).size(12.0)),
+            .text(egui::RichText::new(format!("{}/{} MP", current.max(0), max)).size(11.0)),
     );
-}
-
-fn cooldown_line(ui: &mut egui::Ui, cooldowns: &Cooldowns) {
-    let active: Vec<String> = cooldowns
-        .abilities
-        .iter()
-        .filter(|ability| ability.remaining > 0)
-        .map(|ability| format!("{} {}", ability.ability_id, ability.remaining))
-        .collect();
-    if !active.is_empty() {
-        ui.label(theme::flavour(format!("Cooldowns: {}", active.join(", "))));
-    }
 }
 
 fn action_button(label: &str) -> egui::Button<'static> {
@@ -983,6 +712,58 @@ fn action_button(label: &str) -> egui::Button<'static> {
     )
     .min_size(egui::vec2(118.0, 38.0))
     .fill(theme::PANEL_LIGHT)
+}
+
+fn weapon_reach(equipment: &Equipment, instances: &ItemInstances, data: &GameData) -> Reach {
+    let tags = equipment
+        .main_hand
+        .as_ref()
+        .and_then(|id| base_item_for_instance(id, data, instances))
+        .map(|item| item.tags.clone())
+        .unwrap_or_default();
+    if tags.iter().any(|t| t == "ranged") {
+        Reach::Ranged
+    } else if tags.iter().any(|t| t == "reach") {
+        Reach::Reach
+    } else {
+        Reach::Melee
+    }
+}
+
+fn rank_targets(party: &PartyCombat, enemies: &EnemyQuery) -> Vec<RankTarget> {
+    let mut targets = Vec::new();
+    for (entity, _, _, _, _, member) in party.iter() {
+        targets.push(RankTarget {
+            entity,
+            side: CombatSide::Party,
+            rank: Rank(member.slot),
+        });
+    }
+    for (entity, unit, _, _) in enemies.iter() {
+        targets.push(RankTarget {
+            entity,
+            side: CombatSide::Enemy,
+            rank: Rank(unit.slot),
+        });
+    }
+    targets
+}
+
+fn find_potion(
+    inventory: &Inventory,
+    instances: &ItemInstances,
+    data: &GameData,
+) -> Option<ItemInstanceId> {
+    inventory
+        .items
+        .iter()
+        .find(|id| {
+            base_item_for_instance(id, data, instances)
+                .and_then(|base| base.consumable)
+                .map(|cat| cat == ConsumableCategory::Potion)
+                .unwrap_or(false)
+        })
+        .cloned()
 }
 
 fn node_glyph(
@@ -999,10 +780,10 @@ fn node_glyph(
         MapNodeType::Treasure => ("✦ Treasure", theme::GOLD_BRIGHT),
         MapNodeType::Event => ("❂ Event", theme::INK),
         MapNodeType::Rest => ("☾ Rest", theme::VERDANT),
-        MapNodeType::Town => ("Town", theme::VERDANT),
-        MapNodeType::Shop => ("Shop", theme::GOLD_BRIGHT),
+        MapNodeType::Town => ("⌂ Town", theme::VERDANT),
+        MapNodeType::Shop => ("⚖ Shop", theme::GOLD),
         MapNodeType::Boss => ("☠ Boss", theme::BLOOD),
-        MapNodeType::BonusQuest => ("Bonus Quest", theme::ARCANE),
+        MapNodeType::BonusQuest => ("✪ Quest", theme::ARCANE),
     }
 }
 
@@ -1010,13 +791,13 @@ fn node_hint(node_type: MapNodeType) -> &'static str {
     match node_type {
         MapNodeType::Combat => "A fight against a small band.",
         MapNodeType::Elite => "A harder fight — and better spoils.",
-        MapNodeType::Treasure => "Loot, no fight.",
+        MapNodeType::Treasure => "Rolled loot, no fight.",
         MapNodeType::Event => "Something happens on the road.",
-        MapNodeType::Rest => "Catch your breath and recover.",
-        MapNodeType::Town => "A safe settlement with story and trade.",
-        MapNodeType::Shop => "Buy and sell before the next road.",
+        MapNodeType::Rest => "A safe place to pause.",
+        MapNodeType::Town => "A town with a merchant.",
+        MapNodeType::Shop => "Buy and sell with gold.",
         MapNodeType::Boss => "The Starwood's guardian waits here.",
-        MapNodeType::BonusQuest => "A final optional challenge after the main boss.",
+        MapNodeType::BonusQuest => "An optional post-boss trial.",
     }
 }
 
@@ -1034,29 +815,6 @@ fn enemy_name(id: &str, data: &GameData) -> String {
         .unwrap_or_else(|| id.to_string())
 }
 
-fn equipped_line(equipment: &Equipment, data: &GameData, instances: &ItemInstances) -> String {
-    let mut parts = Vec::new();
-    for id in [
-        &equipment.main_hand,
-        &equipment.body,
-        &equipment.off_hand,
-        &equipment.head,
-        &equipment.feet,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if let Some(item) = base_item_for_instance(id, data, instances) {
-            parts.push(item.name.clone());
-        }
-    }
-    if parts.is_empty() {
-        "—".to_string()
-    } else {
-        parts.join(", ")
-    }
-}
-
 fn combatant_name(
     entity: Entity,
     party: &PartyCombat,
@@ -1066,7 +824,7 @@ fn combatant_name(
     if let Ok((_, character, ..)) = party.get(entity) {
         character.name.clone()
     } else if let Ok((_, unit, _, _)) = enemies.get(entity) {
-        enemy_name(&unit.archetype, data)
+        format!("R{} {}", unit.slot, enemy_name(&unit.archetype, data))
     } else {
         "—".to_string()
     }

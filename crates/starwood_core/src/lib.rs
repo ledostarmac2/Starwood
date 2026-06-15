@@ -19,6 +19,7 @@ impl Plugin for StarwoodCorePlugin {
         app.init_state::<GameState>()
             .add_sub_state::<CreationStep>()
             .insert_resource(InventoryOpen::default())
+            .insert_resource(CampaignSeed(self.seed))
             .insert_resource(GameRng(ChaCha8Rng::seed_from_u64(self.seed)))
             .insert_resource(GameData::default())
             .insert_resource(GameDifficulty::default())
@@ -34,6 +35,7 @@ impl Plugin for StarwoodCorePlugin {
             .insert_resource(EncounterState::default())
             .insert_resource(AssetHandles::default())
             .insert_resource(PendingRolls::default())
+            .insert_resource(DebugDiceOverride::default())
             .add_message::<RollRequest>()
             .add_message::<RollResolved>()
             .add_message::<RollAnimationComplete>()
@@ -235,6 +237,9 @@ pub struct Initiative(pub i32);
 // ===== RESOURCES =====
 #[derive(Resource)]
 pub struct GameRng(pub ChaCha8Rng);
+
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CampaignSeed(pub u64);
 
 #[derive(Resource, Default, Clone, Debug, Serialize, Deserialize)]
 pub struct GameData {
@@ -823,6 +828,18 @@ pub struct PendingRolls {
     pub attacks: HashMap<u64, PendingAttack>,
 }
 
+#[derive(Resource, Default, Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DebugDiceOverride {
+    pub next: Option<ForcedRoll>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ForcedRoll {
+    Nat20,
+    Nat1,
+    Value(u32),
+}
+
 #[derive(Clone)]
 pub struct PendingAttackIntent {
     pub attacker: Entity,
@@ -997,6 +1014,31 @@ pub fn roll_ability_score_gen(rng: &mut ChaCha8Rng) -> RollResolvedParts {
         total,
         is_nat20: false,
         is_nat1: false,
+    }
+}
+
+pub fn forced_roll_parts(expr: &DiceExpr, kind: RollKind, forced: ForcedRoll) -> RollResolvedParts {
+    let sides = expr.sides.max(1);
+    let value = match forced {
+        ForcedRoll::Nat20 => 20.min(sides),
+        ForcedRoll::Nat1 => 1,
+        ForcedRoll::Value(value) => value.clamp(1, sides),
+    };
+
+    if kind == RollKind::AbilityScoreGen {
+        return RollResolvedParts {
+            rolls: vec![value],
+            total: value as i32,
+            is_nat20: false,
+            is_nat1: false,
+        };
+    }
+
+    RollResolvedParts {
+        rolls: vec![value],
+        total: value as i32 + expr.modifier,
+        is_nat20: expr.count == 1 && expr.sides == 20 && value == 20,
+        is_nat1: expr.count == 1 && expr.sides == 20 && value == 1,
     }
 }
 
@@ -1541,8 +1583,19 @@ pub fn roll_item_instance(
     rng: &mut ChaCha8Rng,
     level: u32,
 ) -> ItemInstance {
-    instances.next_serial = instances.next_serial.saturating_add(1);
     let rarity = roll_rarity(data, rng);
+    roll_item_instance_with_rarity(base, data, instances, rng, level, rarity)
+}
+
+pub fn roll_item_instance_with_rarity(
+    base: &ItemData,
+    data: &GameData,
+    instances: &mut ItemInstances,
+    rng: &mut ChaCha8Rng,
+    level: u32,
+    rarity: Rarity,
+) -> ItemInstance {
+    instances.next_serial = instances.next_serial.saturating_add(1);
     let affixes = roll_affixes(base, data, rarity, level, rng);
     let affix_value: i32 = affixes.iter().map(|affix| affix.value.abs()).sum();
     let value = ((base.value as f32 * rarity_value_multiplier(rarity)) as u32)
@@ -2330,7 +2383,9 @@ impl From<SavedEquipment> for Equipment {
 
 #[allow(clippy::too_many_arguments)]
 fn handle_new_game_requests(
+    mut commands: Commands,
     mut requests: EventReader<NewGameRequested>,
+    mut campaign_seed: ResMut<CampaignSeed>,
     mut rng: ResMut<GameRng>,
     mut map: ResMut<MapState>,
     mut party: ResMut<PartyRoster>,
@@ -2343,15 +2398,20 @@ fn handle_new_game_requests(
     mut next_step: ResMut<NextState<CreationStep>>,
 ) {
     for request in requests.read() {
+        campaign_seed.0 = request.seed;
         rng.0 = ChaCha8Rng::seed_from_u64(request.seed);
         *map = generate_map(request.seed, 10);
-        party.members.clear();
+        for entity in party.members.drain(..) {
+            commands.entity(entity).despawn();
+        }
         inventory.items.clear();
         instances.instances.clear();
         instances.next_serial = 0;
         gold.0 = 0;
         *antagonist = Antagonist::generate(request.seed);
-        encounter.enemies.clear();
+        for entity in encounter.enemies.drain(..) {
+            commands.entity(entity).despawn();
+        }
         encounter.turn_order.clear();
         encounter.turn_index = 0;
         encounter.surrendered = false;
@@ -2532,12 +2592,16 @@ fn handle_encounter_requests(
 }
 
 fn handle_encounter_ended_state(
+    mut commands: Commands,
     mut ended: EventReader<EncounterEnded>,
     mut encounter: ResMut<EncounterState>,
     mut next_state: ResMut<NextState<GameState>>,
 ) {
     for event in ended.read() {
         let surrendered = encounter.surrendered;
+        for entity in encounter.enemies.drain(..) {
+            commands.entity(entity).despawn();
+        }
         encounter.enemies.clear();
         encounter.turn_order.clear();
         encounter.turn_index = 0;
@@ -2551,7 +2615,10 @@ fn handle_encounter_ended_state(
 }
 
 fn load_game_data_system(mut commands: Commands) {
-    if let Ok(data) = load_game_data_from_dir("assets/data") {
+    let manifest_assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/data");
+    if let Ok(data) =
+        load_game_data_from_dir("assets/data").or_else(|_| load_game_data_from_dir(manifest_assets))
+    {
         commands.insert_resource(data);
     }
 }
@@ -2560,12 +2627,15 @@ fn resolve_roll_requests(
     mut requests: EventReader<RollRequest>,
     mut resolved: EventWriter<RollResolved>,
     mut rng: ResMut<GameRng>,
+    mut forced: ResMut<DebugDiceOverride>,
     difficulty: Res<GameDifficulty>,
     tuning: Res<DifficultyTuning>,
     party_members: Query<(), With<PartyMember>>,
 ) {
     for request in requests.read() {
-        let parts = if request.kind == RollKind::AbilityScoreGen {
+        let parts = if let Some(forced) = forced.next.take() {
+            forced_roll_parts(&request.expr, request.kind, forced)
+        } else if request.kind == RollKind::AbilityScoreGen {
             roll_ability_score_gen(&mut rng.0)
         } else {
             let is_player = request
@@ -2592,12 +2662,23 @@ fn resolve_roll_requests(
     }
 }
 
+type CombatantActionQuery<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Abilities,
+        Option<&'static Equipment>,
+        Option<&'static Character>,
+        Option<&'static EnemyUnit>,
+    ),
+>;
+
 fn request_combat_actions(
     mut actions: EventReader<CombatActionRequest>,
     mut requests: EventWriter<RollRequest>,
     mut pending: ResMut<PendingRolls>,
     mut rng: ResMut<GameRng>,
-    combatants: Query<(&Abilities, Option<&Equipment>, Option<&Character>)>,
+    combatants: CombatantActionQuery,
     data: Res<GameData>,
     instances: Res<ItemInstances>,
 ) {
@@ -2605,21 +2686,37 @@ fn request_combat_actions(
         if action.action != CombatAction::Attack {
             continue;
         }
-        let Ok((abilities, equipment, character)) = combatants.get(action.actor) else {
+        let Ok((abilities, equipment, character, enemy_unit)) = combatants.get(action.actor) else {
             continue;
         };
-        let level = character.map_or(1, |character| character.level);
-        let ability_mod = ability_modifier(abilities.str_.max(abilities.dex));
-        let attack_bonus = ability_mod + proficiency_bonus(level);
-        let damage = equipment
-            .and_then(|equipment| equipment.main_hand.as_ref())
-            .and_then(|item_id| base_item_for_instance(item_id, &data, &instances))
-            .and_then(|item| item.damage.clone())
-            .unwrap_or(DiceExpr {
-                count: 1,
-                sides: 4,
-                modifier: ability_mod,
-            });
+        let (attack_bonus, damage) = if let Some(enemy_unit) = enemy_unit {
+            if let Some(archetype) = data.enemies.get(&enemy_unit.archetype) {
+                (archetype.attack_bonus, archetype.damage.clone())
+            } else {
+                (
+                    proficiency_bonus(1),
+                    DiceExpr {
+                        count: 1,
+                        sides: 4,
+                        modifier: 0,
+                    },
+                )
+            }
+        } else {
+            let level = character.map_or(1, |character| character.level);
+            let ability_mod = ability_modifier(abilities.str_.max(abilities.dex));
+            let attack_bonus = ability_mod + proficiency_bonus(level);
+            let damage = equipment
+                .and_then(|equipment| equipment.main_hand.as_ref())
+                .and_then(|item_id| base_item_for_instance(item_id, &data, &instances))
+                .and_then(|item| item.damage.clone())
+                .unwrap_or(DiceExpr {
+                    count: 1,
+                    sides: 4,
+                    modifier: ability_mod,
+                });
+            (attack_bonus, damage)
+        };
         let id = rng.0.random::<u64>();
         pending.attack_intents.insert(
             id,

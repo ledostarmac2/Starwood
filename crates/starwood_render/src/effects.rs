@@ -52,6 +52,9 @@ pub(crate) struct DeathFade {
 #[derive(Component)]
 pub struct DownedVisual;
 
+type RouteUnitsQuery<'w, 's> =
+    Query<'w, 's, (), (With<UnitVisual>, Without<Defeated>, Without<DownedVisual>)>;
+
 /// Build the looping idle-bob animation for a `bob_pivot`, desynced via the
 /// render RNG so units breathe independently.
 pub(crate) fn idle_bob_anim(rng: &mut ChaCha8Rng) -> TweenAnim {
@@ -59,7 +62,10 @@ pub(crate) fn idle_bob_anim(rng: &mut ChaCha8Rng) -> TweenAnim {
     let tween = Tween::new(
         EaseFunction::SineInOut,
         Duration::from_millis(duration),
-        TransformPositionLens { start: Vec3::new(0.0, -1.5, 0.0), end: Vec3::new(0.0, 1.5, 0.0) },
+        TransformPositionLens {
+            start: Vec3::new(0.0, -1.5, 0.0),
+            end: Vec3::new(0.0, 1.5, 0.0),
+        },
     )
     .with_repeat_count(RepeatCount::Infinite)
     .with_repeat_strategy(RepeatStrategy::MirroredRepeat);
@@ -80,21 +86,35 @@ pub fn lunge_on_action(
         let Ok(visual) = units.get(action.actor) else {
             continue;
         };
-        let actor_x = transforms.get(action.actor).map(|t| t.translation.x).unwrap_or(0.0);
-        let target_x = transforms.get(action.target).map(|t| t.translation.x).unwrap_or(actor_x + 1.0);
+        let actor_x = transforms
+            .get(action.actor)
+            .map(|t| t.translation.x)
+            .unwrap_or(0.0);
+        let target_x = transforms
+            .get(action.target)
+            .map(|t| t.translation.x)
+            .unwrap_or(actor_x + 1.0);
         let reach = if target_x >= actor_x { 16.0 } else { -16.0 };
 
         let forward = Tween::new(
             EaseFunction::QuadraticOut,
             Duration::from_millis(120),
-            TransformPositionLens { start: Vec3::ZERO, end: Vec3::new(reach, 0.0, 0.0) },
+            TransformPositionLens {
+                start: Vec3::ZERO,
+                end: Vec3::new(reach, 0.0, 0.0),
+            },
         );
         let back = Tween::new(
             EaseFunction::QuadraticIn,
             Duration::from_millis(170),
-            TransformPositionLens { start: Vec3::new(reach, 0.0, 0.0), end: Vec3::ZERO },
+            TransformPositionLens {
+                start: Vec3::new(reach, 0.0, 0.0),
+                end: Vec3::ZERO,
+            },
         );
-        commands.entity(visual.lunge_pivot).insert(TweenAnim::new(forward.then(back)));
+        commands
+            .entity(visual.lunge_pivot)
+            .insert(TweenAnim::new(forward.then(back)));
     }
 }
 
@@ -114,7 +134,9 @@ pub fn react_to_damage(
         }
         for (layer_entity, layer) in &layers {
             if layer.owner == hit.target {
-                commands.entity(layer_entity).insert(FlashEffect { timer: Timer::from_seconds(0.25, TimerMode::Once) });
+                commands.entity(layer_entity).insert(FlashEffect {
+                    timer: Timer::from_seconds(0.25, TimerMode::Once),
+                });
             }
         }
     }
@@ -140,7 +162,11 @@ pub fn run_shake(
     }
 }
 
-pub fn run_flash(mut commands: Commands, time: Res<Time>, mut query: Query<(Entity, &mut Sprite, &mut FlashEffect)>) {
+pub fn run_flash(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut query: Query<(Entity, &mut Sprite, &mut FlashEffect)>,
+) {
     for (entity, mut sprite, mut flash) in &mut query {
         flash.timer.tick(time.delta());
         if flash.timer.is_finished() {
@@ -148,18 +174,37 @@ pub fn run_flash(mut commands: Commands, time: Res<Time>, mut query: Query<(Enti
             commands.entity(entity).remove::<FlashEffect>();
         } else {
             // Strong red at impact, easing back to the untinted sprite.
-            sprite.color = mix_color(Color::srgb(1.0, 0.25, 0.25), Color::WHITE, flash.timer.fraction());
+            sprite.color = mix_color(
+                Color::srgb(1.0, 0.25, 0.25),
+                Color::WHITE,
+                flash.timer.fraction(),
+            );
+        }
+    }
+}
+
+/// Apply the downed visual when core inserts `Downed` on the player character.
+pub fn sync_downed_from_core(
+    mut commands: Commands,
+    added: Query<Entity, Added<Downed>>,
+    pc: Query<&PlayerCharacter>,
+) {
+    for entity in &added {
+        if pc.get(entity).is_ok() {
+            commands.entity(entity).insert(DownedVisual);
         }
     }
 }
 
 /// Route a unit's death: the player character (revivable) enters the downed
-/// state; everyone else (companions, enemies) dissolves permanently.
+/// state; enemies dissolve. Companions are despawned immediately by core on
+/// `UnitDied`, so render does not animate them.
 pub fn route_unit_death(
     mut commands: Commands,
     mut died: MessageReader<UnitDied>,
     pc: Query<&PlayerCharacter>,
-    units: Query<(), (With<UnitVisual>, Without<Defeated>, Without<DownedVisual>)>,
+    enemies: Query<&EnemyUnit>,
+    units: RouteUnitsQuery<'_, '_>,
 ) {
     for death in died.read() {
         if units.get(death.entity).is_err() {
@@ -167,8 +212,10 @@ pub fn route_unit_death(
         }
         if pc.get(death.entity).is_ok() {
             commands.entity(death.entity).insert(DownedVisual);
-        } else {
-            commands.entity(death.entity).insert(DeathFade { timer: Timer::from_seconds(0.6, TimerMode::Once) });
+        } else if enemies.get(death.entity).is_ok() {
+            commands.entity(death.entity).insert(DeathFade {
+                timer: Timer::from_seconds(0.6, TimerMode::Once),
+            });
         }
     }
 }

@@ -1,5 +1,23 @@
 # Contract Changelog
 
+## 2026-06-15 - Integration Harness Amendments
+
+- Added `CampaignSeed(pub u64)` resource so UI/binary/debug harnesses can start
+  deterministic campaigns through the same `NewGameRequested` path.
+- Added `DebugDiceOverride` and `ForcedRoll` so debug tooling can force the next
+  authoritative core roll without UI-side RNG.
+- Added `forced_roll_parts()` and `roll_item_instance_with_rarity()` helpers for
+  debug harnesses and deterministic tests.
+- `NewGameRequested` now despawns old party/enemy entities, resets item
+  instances/gold/encounter state, updates `CampaignSeed`, regenerates the
+  antagonist, and enters character creation.
+- `CombatActionRequest` now resolves enemy attacks from `EnemyArchetypeData`
+  (`attack_bonus` and `damage`) when the actor is an `EnemyUnit`.
+- Encounter cleanup now despawns tracked enemy entities before clearing
+  `EncounterState`.
+- `load_game_data_system` now falls back to the workspace `assets/data` path for
+  headless crate tests as well as normal root-launched runs.
+
 ## 2026-06-13 - Design Decisions Contract Amendments
 
 Breaking contract amendments from `Starwood_Design_Decisions.md` are now

@@ -23,8 +23,7 @@ Still optional (nice-to-have, not blocking):
    `DamageDealt`, so friendly-fire already "just works" if core emits
    `DamageDealt` for every affected entity (including allies). A coarse
    `AoeResolved { origin_rank, side, affected: Vec<Entity> }` message would let
-   render add a single shared shockwave/ring at the blast and is preferred for
-   the marquee AoE effect, but is optional.
+   render add a single shared shockwave/ring at the blast and is optional.
 
 ## From `starwood_ui` (Claude Code)
 
@@ -42,29 +41,32 @@ stop interpreting results and let core stay the single source of truth.
    local transition stash for its current overlay, but the published core
    contract is available.
 
-3. **A character-finalize / party-spawn helper in core.**
-   On Review-confirm the UI builds the member entity (via the public
-   `apply_race_mods` / `derived_stats` / … functions) and pushes it onto
-   `PartyRoster`. *Ask:* a `core` helper such as
-   `spawn_party_member(commands, draft-like input) -> Entity` so entity assembly
-   lives next to the rules it depends on. The same helper would serve the
-   Continue/save-load path (`spawn_member_from_saved`).
+3. **Resolved: PC build is message-driven.** Review-confirm fires
+   `CharacterBuildRequested`; core spawns the PC. The UI keeps
+   `spawn_member_from_saved` only for the Continue/save-load path.
 
-4. **Encounter exits could be owned by core.**
-   The UI listens for `EncounterEnded` and performs the state transition +
-   stage cleanup (despawn foes, clear `EncounterState`, award loot), and adds a
-   "flee" path (`EncounterEnded { victory: false }` plus a UI-side `fled` flag so
-   it resolves to Exploration rather than GameOver). Note `detect_encounter_end`
-   re-fires `EncounterEnded` every frame until `EncounterState.enemies` is
-   cleared; the UI guards against the duplicates, but a one-shot guard in core
-   would be cleaner.
+4. **Resolved: core owns encounter exits.** `handle_encounter_ended_state`
+   transitions to Exploration/GameOver and `SurrenderRequested` replaces flee.
 
-5. **Camera ownership.** Render is the nominal camera owner but ships as a stub,
-   so `starwood_ui` spawns a `Camera2d` only if none exists. Please pick one
-   crate (likely render) to own it so the guard can be removed.
+5. **Camera ownership.** Render owns the `Camera2d` in `StarwoodRenderPlugin`;
+   UI should remove its fallback camera spawn once integrated.
 
-## Current Out-of-Lane Workspace Blocker
+6. **Turn advancement has no owner.** Core builds the initial turn order and sets
+   the first `ActiveTurn`, but nothing moves it afterward, so the UI advances
+   `ActiveTurn` (in `hud::advance_turn_after_action`, on `RollAnimationComplete`
+   or a no-roll action). *Ask:* if core wants combat fully authoritative, a core
+   turn-advance system (driven off `RollAnimationComplete` + an
+   `ActionResolved`/`TurnEnded` message) would let the UI stop owning this.
 
-`cargo check --workspace` is blocked in `starwood_render`: `resolve_item_icons`
-is public while its `Without<IconResolved>` query marker is private. This is a
-render-crate visibility fix; Codex did not edit render per the lane boundary.
+7. **Resolved: dead/leftover foes are despawned on encounter cleanup.**
+   `handle_encounter_ended_state` now despawns every entity still tracked in
+   `EncounterState.enemies` before clearing encounter state.
+
+8. **Resolved: enemy attacks use archetype stats.** `request_combat_actions`
+   now uses `EnemyArchetypeData.attack_bonus` and `damage` when the actor is an
+   `EnemyUnit`.
+
+9. **No enemy rank-collapse.** Enemies keep their spawn `slot`, so once a
+   melee-reachable front rank dies the back ranks stay unreachable. The UI keeps
+   the frontmost living foe always-targetable to avoid a soft-lock. A core
+   rank-collapse (or `RankChanged`) on death would make reach honest.

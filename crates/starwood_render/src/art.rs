@@ -13,7 +13,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::ImageSampler;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use starwood_core::{ItemData, ItemSlot};
+use starwood_core::{FrameColor, ItemData, ItemSlot};
 
 pub const BODY_SIZE: u32 = 64;
 pub const ITEM_SIZE: u32 = 32;
@@ -52,7 +52,11 @@ struct Canvas {
 
 impl Canvas {
     fn new(w: u32, h: u32) -> Self {
-        Self { w, h, px: vec![0; (w * h * 4) as usize] }
+        Self {
+            w,
+            h,
+            px: vec![0; (w * h * 4) as usize],
+        }
     }
 
     fn blend(&mut self, x: i32, y: i32, c: Rgba) {
@@ -66,9 +70,9 @@ impl Canvas {
         }
         // Simple "over" alpha blend onto the existing pixel.
         let a = c[3] as f32 / 255.0;
-        for k in 0..3 {
+        for (k, channel) in c.iter().take(3).enumerate() {
             let dst = self.px[idx + k] as f32;
-            self.px[idx + k] = (c[k] as f32 * a + dst * (1.0 - a)).round() as u8;
+            self.px[idx + k] = (*channel as f32 * a + dst * (1.0 - a)).round() as u8;
         }
         let dst_a = self.px[idx + 3] as f32 / 255.0;
         self.px[idx + 3] = (((a + dst_a * (1.0 - a)) * 255.0).round() as u8).max(self.px[idx + 3]);
@@ -118,7 +122,11 @@ impl Canvas {
 
     fn into_image(self) -> Image {
         let mut image = Image::new(
-            Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
+            Extent3d {
+                width: self.w,
+                height: self.h,
+                depth_or_array_layers: 1,
+            },
             TextureDimension::D2,
             self.px,
             TextureFormat::Rgba8UnormSrgb,
@@ -306,7 +314,7 @@ pub fn generate_item(item: &ItemData) -> Image {
             // Gem.
             c.line(16, 6, 26, 16, 1, OUTLINE);
             for y in 6..26 {
-                let half = (8 - ((y as i32) - 16).abs() / 2).max(0i32);
+                let half = (8 - (y - 16_i32).abs() / 2).max(0);
                 c.rect(16 - half, y, 16 + half, y + 1, primary);
             }
         }
@@ -325,12 +333,33 @@ fn color_to_rgba(color: Color) -> Rgba {
     ]
 }
 
-/// Generate a rarity-frame placeholder: a soft translucent background ringed by
-/// a bright border in the tier's color, with brighter corner accents that scale
-/// with the tier's `glow` (so legendary/mythic frames pop). Drawn behind item
-/// icons by [`crate::icons`].
+/// Generate a rarity-frame placeholder using core's frame color.
+pub fn generate_rarity_frame_from_color(frame: FrameColor, tier: u8) -> Image {
+    build_rarity_frame_image(&crate::rarity::rarity_style_from_frame(frame, tier))
+}
+
+/// Generate a rarity-frame placeholder from a tier (fallback table).
+#[allow(dead_code)] // used by unit tests when core RarityData is unavailable
 pub fn generate_rarity_frame(tier: u8) -> Image {
-    let style = crate::rarity::rarity_style(tier);
+    build_rarity_frame_image(&crate::rarity::rarity_style(tier))
+}
+
+/// Generic fallback for any missing sprite key — distinct hash-colored silhouette.
+pub fn generate_fallback_sprite(key: &str, width: u32, height: u32) -> Image {
+    let mut c = Canvas::new(width, height);
+    let primary = primary_for(key);
+    c.panel(2, 2, width as i32 - 2, height as i32 - 2, primary);
+    c.rect(
+        4,
+        4,
+        width as i32 - 4,
+        height as i32 - 4,
+        shade(primary, 1.2),
+    );
+    c.into_image()
+}
+
+fn build_rarity_frame_image(style: &crate::rarity::RarityStyle) -> Image {
     let frame = color_to_rgba(style.frame);
     let fill = color_to_rgba(style.fill);
 

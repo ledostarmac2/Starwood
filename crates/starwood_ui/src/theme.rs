@@ -110,6 +110,22 @@ pub fn signed(value: i32) -> String {
     }
 }
 
+/// Convert a core `FrameColor` (rarity frame) into an egui colour.
+pub fn frame_color(color: starwood_core::FrameColor) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(color.r, color.g, color.b, color.a)
+}
+
+/// A card frame tinted by a rarity frame colour (for item tiles/tooltips).
+pub fn rarity_card(color: egui::Color32, selected: bool) -> egui::Frame {
+    let width = if selected { 2.5 } else { 1.5 };
+    egui::Frame::new()
+        .fill(PANEL)
+        .stroke(egui::Stroke::new(width, color))
+        .corner_radius(egui::CornerRadius::same(5))
+        .inner_margin(egui::Margin::same(7))
+        .outer_margin(egui::Margin::symmetric(0, 3))
+}
+
 /// Apply the theme exactly once, after the egui primary context exists.
 ///
 /// `installed` is a per-system `Local` flag so the (slightly expensive) font

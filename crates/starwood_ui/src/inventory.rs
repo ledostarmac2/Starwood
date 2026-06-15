@@ -1,54 +1,51 @@
-//! Inventory overlay, character sheet, and skills tab.
+//! Inventory overlay, shop, character sheet, skills tab, and talent tree.
 //!
-//! The inventory is an overlay toggled by core's [`InventoryOpen`] flag, so the
-//! world keeps rendering underneath. Equipping / unequipping mutates the
-//! member's [`Equipment`] and fires [`EquipmentChanged`] (which the render crate
-//! listens for to re-compose the paper-doll) and [`InventoryChanged`].
+//! Items are **rolled instances**: `Equipment` slots and core's `Inventory` hold
+//! [`ItemInstanceId`]s resolved through [`ItemInstances`] + [`base_item_for_instance`].
+//! Tiles draw rarity-coloured frames and tooltips list the rolled affixes.
 //!
-//! Item icons are *owned by the render crate*; until it exposes textures we
-//! show simple lettered tiles as a stand-in (a UI affordance, not a world
-//! sprite). Swapping to `egui::Image` later needs no structural change here.
+//! Equip/unequip mutates the member's [`Equipment`] and fires [`EquipmentChanged`]
+//! / [`InventoryChanged`]; consumable use, buying, and selling go through core's
+//! [`ConsumableUseRequested`] / [`ShopTransactionRequested`] messages.
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
+use rand_chacha::ChaCha8Rng;
 use starwood_core::*;
 
-use crate::hud::UiSelection;
+use crate::hud::UiState;
 use crate::theme;
 
-/// The party's shared stash of unequipped items, plus a couple of flow flags.
+/// The current shop's rolled stock (instances already live in `ItemInstances`).
 #[derive(Resource, Default)]
-pub struct PartyInventory {
-    pub items: Vec<ItemId>,
-    /// Set by a Rest map node; consumed by `hud::apply_rest`.
-    pub rest_requested: bool,
-    /// Set by a Shop map node; consumed by the shop overlay.
-    pub shop_open: bool,
-    /// Whether the starter stash has been seeded for this run.
-    pub seeded: bool,
+pub struct ShopStock {
+    pub items: Vec<ItemInstanceId>,
+    pub open: bool,
 }
 
-/// Seed a few swappable items the first time the party reaches Exploration, so
-/// the inventory has something to equip in the first milestone.
-pub fn ensure_starter_stash(mut inventory: ResMut<PartyInventory>) {
-    if inventory.seeded {
-        return;
+/// Roll `count` shop items into `ItemInstances`, returning their ids.
+pub fn roll_shop_stock(
+    data: &GameData,
+    instances: &mut ItemInstances,
+    rng: &mut ChaCha8Rng,
+    level: u32,
+    count: usize,
+) -> Vec<ItemInstanceId> {
+    let mut bases: Vec<&ItemData> = data
+        .items
+        .values()
+        .filter(|item| !matches!(item.slot, ItemSlot::Treasure))
+        .collect();
+    bases.sort_by(|a, b| a.id.cmp(&b.id));
+    if bases.is_empty() {
+        return Vec::new();
     }
-    inventory.seeded = true;
-    inventory.items.extend(
-        [
-            "iron_helm",
-            "leather_armor",
-            "scale_mail",
-            "wooden_shield",
-            "dagger",
-            "mace",
-            "soft_boots",
-            "healing_draught",
-        ]
-        .into_iter()
-        .map(str::to_string),
-    );
+    (0..count)
+        .map(|i| {
+            let base = bases[i % bases.len()];
+            roll_item_instance(base, data, instances, rng, level).instance_id
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -82,23 +79,23 @@ impl EquipSlot {
         }
     }
 
-    fn slot_mut(self, equipment: &mut Equipment) -> &mut Option<ItemId> {
+    fn get(self, e: &Equipment) -> &Option<ItemInstanceId> {
         match self {
-            Self::Head => &mut equipment.head,
-            Self::Body => &mut equipment.body,
-            Self::MainHand => &mut equipment.main_hand,
-            Self::OffHand => &mut equipment.off_hand,
-            Self::Feet => &mut equipment.feet,
+            Self::Head => &e.head,
+            Self::Body => &e.body,
+            Self::MainHand => &e.main_hand,
+            Self::OffHand => &e.off_hand,
+            Self::Feet => &e.feet,
         }
     }
 
-    fn get(self, equipment: &Equipment) -> &Option<ItemId> {
+    fn slot_mut(self, e: &mut Equipment) -> &mut Option<ItemInstanceId> {
         match self {
-            Self::Head => &equipment.head,
-            Self::Body => &equipment.body,
-            Self::MainHand => &equipment.main_hand,
-            Self::OffHand => &equipment.off_hand,
-            Self::Feet => &equipment.feet,
+            Self::Head => &mut e.head,
+            Self::Body => &mut e.body,
+            Self::MainHand => &mut e.main_hand,
+            Self::OffHand => &mut e.off_hand,
+            Self::Feet => &mut e.feet,
         }
     }
 }
@@ -116,39 +113,46 @@ type SheetQuery<'w, 's> = Query<
     's,
     (
         Entity,
-        &'static Character,
+        &'static mut Character,
         &'static mut Equipment,
         &'static Abilities,
         &'static Derived,
         &'static SkillSet,
         &'static Traits,
+        &'static mut Talents,
+        &'static mut TalentPoints,
+        &'static Health,
         &'static PartyMember,
     ),
     Without<EnemyUnit>,
 >;
 
-#[allow(clippy::too_many_arguments)]
+/// Deferred item action so we never mutate while drawing the list.
+enum ItemAction {
+    Equip(ItemInstanceId),
+    Use(ItemInstanceId),
+    Unequip(EquipSlot),
+}
+
 pub fn inventory_ui(
     mut contexts: EguiContexts,
     mut inventory_open: ResMut<InventoryOpen>,
-    mut selection: ResMut<UiSelection>,
+    mut ui_state: ResMut<UiState>,
     mut party: SheetQuery,
-    mut inventory: ResMut<PartyInventory>,
-    data: Res<GameData>,
+    mut inventory: ResMut<Inventory>,
     instances: Res<ItemInstances>,
-    mut gold: ResMut<Gold>,
+    gold: Res<Gold>,
+    data: Res<GameData>,
     mut equip_changed: EventWriter<EquipmentChanged>,
     mut inv_changed: EventWriter<InventoryChanged>,
+    mut consume: EventWriter<ConsumableUseRequested>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
 
-    // Make sure something is selected if any window is open.
-    if selection.selected_member.is_none() {
-        selection.selected_member = party.iter().min_by_key(|(.., m)| m.slot).map(|t| t.0);
+    if ui_state.selected_member.is_none() {
+        ui_state.selected_member = party.iter().min_by_key(|(.., m)| m.slot).map(|t| t.0);
     }
-    let selected = selection.selected_member;
-
-    // Roster list for the member selector (drop the query borrow before get_mut).
+    let selected = ui_state.selected_member;
     let mut roster: Vec<(Entity, String, u8)> = party
         .iter()
         .map(|(e, c, .., m)| (e, c.name.clone(), m.slot))
@@ -159,8 +163,7 @@ pub fn inventory_ui(
     if inventory_open.0 {
         let mut open = true;
         let mut new_selected = selected;
-        let mut to_equip: Option<usize> = None;
-        let mut to_unequip: Option<EquipSlot> = None;
+        let mut action: Option<ItemAction> = None;
 
         egui::Window::new(
             egui::RichText::new("Inventory & Gear")
@@ -169,134 +172,156 @@ pub fn inventory_ui(
         )
         .open(&mut open)
         .resizable(true)
-        .default_width(560.0)
+        .default_width(620.0)
         .frame(theme::hero_frame())
         .show(ctx, |ui| {
-            member_selector(ui, &roster, selected, &mut new_selected);
-            ui.label(theme::flavour(format!(
-                "Gold: {}   Stash: {}/20",
-                gold.0,
-                inventory.items.len().min(INVENTORY_CAPACITY)
-            )));
+            ui.horizontal(|ui| {
+                member_tabs(ui, &roster, selected, &mut new_selected);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} / {} slots   ·   {} gold",
+                            inventory.items.len(),
+                            INVENTORY_CAPACITY,
+                            gold.0
+                        ))
+                        .color(theme::GOLD),
+                    );
+                });
+            });
             ui.separator();
 
-            if let Some(member) = selected {
-                if let Ok((_, _, equipment, _, _, _, _, _)) = party.get(member) {
-                    ui.columns(2, |cols| {
-                        // Equipped column.
-                        cols[0].label(theme::heading("Equipped"));
-                        for slot in ALL_SLOTS {
-                            let current = slot.get(equipment).clone();
-                            theme::card_frame(false).show(&mut cols[0], |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(slot.label())
-                                            .color(theme::GOLD)
-                                            .strong(),
-                                    );
-                                    match &current {
-                                        Some(id) => {
-                                            ui.label(item_name(id, &data, &instances));
-                                            if ui.small_button("Unequip").clicked() {
-                                                to_unequip = Some(slot);
-                                            }
-                                        }
-                                        None => {
-                                            ui.label(theme::flavour("— empty —"));
+            if let Some(member) = selected.and_then(|m| party.get(m).ok()) {
+                let (_, _, equipment, _, _, _, _, _, _, _, _) = member;
+                ui.columns(2, |cols| {
+                    cols[0].label(theme::heading("Equipped"));
+                    for slot in ALL_SLOTS {
+                        let current = slot.get(equipment).clone();
+                        theme::card_frame(false).show(&mut cols[0], |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(slot.label())
+                                        .color(theme::GOLD)
+                                        .strong(),
+                                );
+                                match &current {
+                                    Some(id) => {
+                                        item_label(ui, id, &instances, &data);
+                                        if ui.small_button("Unequip").clicked() {
+                                            action = Some(ItemAction::Unequip(slot));
                                         }
                                     }
-                                });
+                                    None => {
+                                        ui.label(theme::flavour("— empty —"));
+                                    }
+                                }
                             });
-                        }
+                        });
+                    }
 
-                        // Stash column.
-                        cols[1].label(theme::heading("Stash"));
-                        egui::ScrollArea::vertical()
-                            .max_height(320.0)
-                            .show(&mut cols[1], |ui| {
-                                for (index, item_id) in inventory.items.iter().enumerate() {
-                                    let Some(item) =
-                                        base_item_for_instance(item_id, &data, &instances)
-                                    else {
-                                        continue;
-                                    };
-                                    let instance = instances.instances.get(item_id);
-                                    theme::card_frame(false).show(ui, |ui| {
+                    cols[1].label(theme::heading("Stash"));
+                    egui::ScrollArea::vertical()
+                        .max_height(360.0)
+                        .show(&mut cols[1], |ui| {
+                            for item_id in inventory.items.iter() {
+                                let Some(base) = base_item_for_instance(item_id, &data, &instances)
+                                else {
+                                    continue;
+                                };
+                                let frame = rarity_frame(item_id, &instances, &data);
+                                frame
+                                    .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            item_tile(
-                                                ui,
-                                                &item.name,
-                                                rarity_color(instance, &data),
+                                            item_label(ui, item_id, &instances, &data);
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if base.consumable.is_some() {
+                                                        if ui.small_button("Use").clicked() {
+                                                            action = Some(ItemAction::Use(
+                                                                item_id.clone(),
+                                                            ));
+                                                        }
+                                                    } else if EquipSlot::of(&base.slot).is_some()
+                                                        && ui.small_button("Equip").clicked()
+                                                    {
+                                                        action = Some(ItemAction::Equip(
+                                                            item_id.clone(),
+                                                        ));
+                                                    }
+                                                },
                                             );
-                                            ui.vertical(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new(item.name.as_str())
-                                                        .strong(),
-                                                );
-                                                ui.label(theme::flavour(item_stat_line(
-                                                    item, instance,
-                                                )));
-                                            });
-                                            if EquipSlot::of(&item.slot).is_some()
-                                                && ui.small_button("Equip").clicked()
-                                            {
-                                                to_equip = Some(index);
-                                            }
-                                        })
-                                        .response
-                                        .on_hover_text(item_tooltip(item, instance, &data));
-                                    });
-                                }
-                                if inventory.items.is_empty() {
-                                    ui.label(theme::flavour("The stash is empty."));
-                                }
-                            });
-                    });
-                }
+                                        });
+                                    })
+                                    .response
+                                    .on_hover_ui(|ui| item_tooltip(ui, item_id, &instances, &data));
+                            }
+                            if inventory.items.is_empty() {
+                                ui.label(theme::flavour("The stash is empty."));
+                            }
+                        });
+                });
             } else {
                 ui.label(theme::flavour("No party member selected."));
             }
         });
 
-        // Apply the deferred equip/unequip, then propagate the changes.
-        if let Some(member) = selected {
-            if let Ok((_, _, mut equipment, _, _, _, _, _)) = party.get_mut(member) {
-                let mut changed = false;
-                if let Some(slot) = to_unequip {
-                    if let Some(prev) = slot.slot_mut(&mut equipment).take() {
-                        inventory.items.push(prev);
-                        changed = true;
-                    }
+        // Apply the deferred action.
+        if let (Some(member), Some(action)) = (selected, action) {
+            match action {
+                ItemAction::Use(item) => {
+                    consume.write(ConsumableUseRequested {
+                        actor: member,
+                        item,
+                    });
                 }
-                if let Some(index) = to_equip {
-                    if index < inventory.items.len() {
-                        let item_id = inventory.items[index].clone();
-                        if let Some(target) = base_item_for_instance(&item_id, &data, &instances)
-                            .and_then(|i| EquipSlot::of(&i.slot))
-                        {
-                            let dest = target.slot_mut(&mut equipment);
-                            let previous = dest.replace(item_id);
-                            inventory.items.remove(index);
-                            if let Some(previous) = previous {
-                                inventory.items.push(previous);
+                ItemAction::Unequip(slot) => {
+                    if let Ok((_, _, mut equipment, ..)) = party.get_mut(member) {
+                        if let Some(prev) = slot.slot_mut(&mut equipment).take() {
+                            if add_item_to_inventory(&mut inventory, prev.clone()) {
+                                equip_changed.write(EquipmentChanged { entity: member });
+                                inv_changed.write(InventoryChanged);
+                            } else {
+                                // No room — put it back on.
+                                *slot.slot_mut(&mut equipment) = Some(prev);
                             }
-                            changed = true;
                         }
                     }
                 }
-                if changed {
-                    equip_changed.write(EquipmentChanged { entity: member });
-                    inv_changed.write(InventoryChanged);
+                ItemAction::Equip(item) => {
+                    let target_slot = data
+                        .items
+                        .get(
+                            instances
+                                .instances
+                                .get(&item)
+                                .map(|i| &i.base)
+                                .unwrap_or(&item),
+                        )
+                        .and_then(|base| EquipSlot::of(&base.slot));
+                    if let (Some(target), Ok((_, _, mut equipment, ..))) =
+                        (target_slot, party.get_mut(member))
+                    {
+                        if let Some(index) = inventory.items.iter().position(|id| id == &item) {
+                            inventory.items.remove(index);
+                            let previous = target.slot_mut(&mut equipment).replace(item);
+                            if let Some(previous) = previous {
+                                let _ = add_item_to_inventory(&mut inventory, previous);
+                            }
+                            equip_changed.write(EquipmentChanged { entity: member });
+                            inv_changed.write(InventoryChanged);
+                        }
+                    }
                 }
             }
         }
 
-        selection.selected_member = new_selected;
+        ui_state.selected_member = new_selected;
         inventory_open.0 = open;
     }
 
     // ---- Character sheet ----
-    if selection.show_sheet {
+    if ui_state.show_sheet {
         let mut open = true;
         egui::Window::new(
             egui::RichText::new("Character Sheet")
@@ -304,23 +329,22 @@ pub fn inventory_ui(
                 .color(theme::GOLD_BRIGHT),
         )
         .open(&mut open)
-        .resizable(true)
         .default_width(420.0)
         .frame(theme::hero_frame())
         .show(ctx, |ui| {
-            if let Some((_, character, _, abilities, derived, _, traits, _)) =
+            if let Some((_, character, _, abilities, derived, _, traits, _, _, health, _)) =
                 selected.and_then(|m| party.get(m).ok())
             {
-                character_sheet(ui, character, *abilities, *derived, traits, &data);
+                character_sheet(ui, character, *abilities, *derived, *health, traits, &data);
             } else {
                 ui.label(theme::flavour("No party member selected."));
             }
         });
-        selection.show_sheet = open;
+        ui_state.show_sheet = open;
     }
 
     // ---- Skills tab ----
-    if selection.show_skills {
+    if ui_state.show_skills {
         let mut open = true;
         egui::Window::new(
             egui::RichText::new("Skills")
@@ -328,11 +352,10 @@ pub fn inventory_ui(
                 .color(theme::GOLD_BRIGHT),
         )
         .open(&mut open)
-        .resizable(true)
         .default_width(440.0)
         .frame(theme::hero_frame())
         .show(ctx, |ui| {
-            if let Some((_, character, _, abilities, _, skills, _, _)) =
+            if let Some((_, character, _, abilities, _, skills, _, _, _, _, _)) =
                 selected.and_then(|m| party.get(m).ok())
             {
                 skills_tab(ui, *abilities, skills, character.level, &data);
@@ -340,34 +363,200 @@ pub fn inventory_ui(
                 ui.label(theme::flavour("No party member selected."));
             }
         });
-        selection.show_skills = open;
+        ui_state.show_skills = open;
     }
 
-    if inventory.shop_open {
-        shop_ui(ctx, &mut inventory, &data, &mut gold, &mut inv_changed);
+    // ---- Talent tree + subclass ----
+    if ui_state.show_talents {
+        let mut open = true;
+        let mut pick: Option<TalentId> = None;
+        let mut subclass_pick: Option<ClassId> = None;
+        egui::Window::new(
+            egui::RichText::new("Talents")
+                .size(20.0)
+                .color(theme::GOLD_BRIGHT),
+        )
+        .open(&mut open)
+        .default_width(460.0)
+        .frame(theme::hero_frame())
+        .show(ctx, |ui| {
+            if let Some((_, character, _, _, _, _, _, talents, points, _, _)) =
+                selected.and_then(|m| party.get(m).ok())
+            {
+                talent_tree(
+                    ui,
+                    character,
+                    talents,
+                    *points,
+                    &data,
+                    &mut pick,
+                    &mut subclass_pick,
+                );
+            } else {
+                ui.label(theme::flavour("No party member selected."));
+            }
+        });
+        if let Some(member) = selected {
+            if let Ok((_, mut character, _, _, _, _, _, mut talents, mut points, _, _)) =
+                party.get_mut(member)
+            {
+                if let Some(node_id) = pick {
+                    if let Some(node) = talent_node(&character.class, &node_id, &data) {
+                        let prereqs = node.requires.iter().all(|r| talents.0.contains(r));
+                        if points.0 >= node.cost
+                            && prereqs
+                            && !talents.0.contains(&node_id)
+                            && character.level >= node.unlock_level
+                        {
+                            talents.0.push(node_id);
+                            points.0 -= node.cost;
+                        }
+                    }
+                }
+                if let Some(class_id) = subclass_pick {
+                    if can_unlock_subclass(&character) {
+                        character.subclass = Some(class_id);
+                    }
+                }
+            }
+        }
+        ui_state.show_talents = open;
     }
 
     Ok(())
 }
 
+// ===== Shop ========================================================
+
+pub fn shop_ui(
+    mut contexts: EguiContexts,
+    mut shop: ResMut<ShopStock>,
+    inventory: Res<Inventory>,
+    instances: Res<ItemInstances>,
+    gold: Res<Gold>,
+    data: Res<GameData>,
+    mut shop_tx: EventWriter<ShopTransactionRequested>,
+) -> Result {
+    if !shop.open {
+        return Ok(());
+    }
+    let ctx = contexts.ctx_mut()?;
+    let mut open = true;
+    egui::Window::new(
+        egui::RichText::new("Merchant")
+            .size(22.0)
+            .color(theme::GOLD_BRIGHT),
+    )
+    .open(&mut open)
+    .resizable(true)
+    .default_width(620.0)
+    .frame(theme::hero_frame())
+    .show(ctx, |ui| {
+        ui.label(
+            egui::RichText::new(format!("Your gold: {}", gold.0))
+                .color(theme::GOLD)
+                .strong(),
+        );
+        ui.separator();
+        ui.columns(2, |cols| {
+            cols[0].label(theme::heading("For Sale"));
+            egui::ScrollArea::vertical()
+                .id_salt("shop_buy")
+                .max_height(360.0)
+                .show(&mut cols[0], |ui| {
+                    for item_id in shop.items.iter() {
+                        let Some(item) = instances.instances.get(item_id) else {
+                            continue;
+                        };
+                        let price = buy_price(item);
+                        rarity_frame(item_id, &instances, &data)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    item_label(ui, item_id, &instances, &data);
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let afford = gold.0 >= price;
+                                            if ui
+                                                .add_enabled(
+                                                    afford,
+                                                    egui::Button::new(format!("Buy {price}g")),
+                                                )
+                                                .clicked()
+                                            {
+                                                shop_tx.write(ShopTransactionRequested {
+                                                    item: item_id.clone(),
+                                                    transaction: ShopTransaction::Buy,
+                                                });
+                                            }
+                                        },
+                                    );
+                                });
+                            })
+                            .response
+                            .on_hover_ui(|ui| item_tooltip(ui, item_id, &instances, &data));
+                    }
+                });
+
+            cols[1].label(theme::heading("Your Stash"));
+            egui::ScrollArea::vertical()
+                .id_salt("shop_sell")
+                .max_height(360.0)
+                .show(&mut cols[1], |ui| {
+                    for item_id in inventory.items.iter() {
+                        let Some(item) = instances.instances.get(item_id) else {
+                            continue;
+                        };
+                        let price = sell_price(item);
+                        rarity_frame(item_id, &instances, &data)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    item_label(ui, item_id, &instances, &data);
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.button(format!("Sell {price}g")).clicked() {
+                                                shop_tx.write(ShopTransactionRequested {
+                                                    item: item_id.clone(),
+                                                    transaction: ShopTransaction::Sell,
+                                                });
+                                            }
+                                        },
+                                    );
+                                });
+                            })
+                            .response
+                            .on_hover_ui(|ui| item_tooltip(ui, item_id, &instances, &data));
+                    }
+                });
+        });
+        ui.add_space(6.0);
+        if ui.button("Leave").clicked() {
+            shop.open = false;
+        }
+    });
+    if !open {
+        shop.open = false;
+    }
+    Ok(())
+}
+
 // ===== Sub-views ===================================================
 
-fn member_selector(
+fn member_tabs(
     ui: &mut egui::Ui,
     roster: &[(Entity, String, u8)],
     selected: Option<Entity>,
     new_selected: &mut Option<Entity>,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        for (entity, name, _) in roster {
-            if ui
-                .selectable_label(selected == Some(*entity), name.as_str())
-                .clicked()
-            {
-                *new_selected = Some(*entity);
-            }
+    for (entity, name, _) in roster {
+        if ui
+            .selectable_label(selected == Some(*entity), name.as_str())
+            .clicked()
+        {
+            *new_selected = Some(*entity);
         }
-    });
+    }
 }
 
 fn character_sheet(
@@ -375,6 +564,7 @@ fn character_sheet(
     character: &Character,
     abilities: Abilities,
     derived: Derived,
+    health: Health,
     traits: &Traits,
     data: &GameData,
 ) {
@@ -384,11 +574,16 @@ fn character_sheet(
             .color(theme::GOLD_BRIGHT)
             .strong(),
     );
+    let subclass = character
+        .subclass
+        .as_ref()
+        .map(|s| format!(" / {}", class_display(s, data)))
+        .unwrap_or_default();
     ui.label(format!(
-        "Level {} {} {}",
+        "Level {} {} {}{subclass}",
         character.level,
         race_name(&character.race, data),
-        class_display(&character.class, data),
+        class_display(&character.class, data)
     ));
     ui.label(theme::flavour(format!("XP {}", character.xp)));
     ui.add_space(8.0);
@@ -414,12 +609,13 @@ fn character_sheet(
     ui.add_space(8.0);
     ui.label(theme::heading("Derived"));
     ui.label(format!(
-        "HP {}   ·   AC {}   ·   Initiative {}   ·   Proficiency {}   ·   Speed {}",
+        "HP {}/{}   ·   AC {}   ·   Init {}   ·   Prof {}   ·   Speed {}",
+        health.current,
         derived.max_hp,
         derived.armor_class,
         theme::signed(derived.initiative_mod),
         theme::signed(derived.proficiency),
-        derived.speed,
+        derived.speed
     ));
 
     ui.add_space(8.0);
@@ -449,7 +645,6 @@ fn skills_tab(
     ui.add_space(6.0);
     let mut all: Vec<&SkillData> = data.skills.values().collect();
     all.sort_by(|a, b| a.name.cmp(&b.name));
-
     egui::Grid::new("skills_grid")
         .num_columns(3)
         .striped(true)
@@ -461,12 +656,12 @@ fn skills_tab(
             for skill in all {
                 let proficient = skills.proficient.iter().any(|id| id == &skill.id);
                 let bonus = skill_bonus(abilities, skill, skills, level);
-                let name = ui.label(format!(
+                ui.label(format!(
                     "{}  ({})",
                     skill.name,
                     skill.ability.to_uppercase()
-                ));
-                name.on_hover_text(skill.description.as_str());
+                ))
+                .on_hover_text(skill.description.as_str());
                 ui.label(
                     egui::RichText::new(theme::signed(bonus))
                         .color(theme::GOLD)
@@ -478,138 +673,153 @@ fn skills_tab(
         });
 }
 
-fn shop_ui(
-    ctx: &egui::Context,
-    inventory: &mut PartyInventory,
+fn talent_tree(
+    ui: &mut egui::Ui,
+    character: &Character,
+    talents: &Talents,
+    points: TalentPoints,
     data: &GameData,
-    gold: &mut Gold,
-    inv_changed: &mut EventWriter<InventoryChanged>,
+    pick: &mut Option<TalentId>,
+    subclass_pick: &mut Option<ClassId>,
 ) {
-    let mut open = inventory.shop_open;
-    egui::Window::new(
-        egui::RichText::new("Shop")
-            .size(20.0)
-            .color(theme::GOLD_BRIGHT),
-    )
-    .open(&mut open)
-    .resizable(true)
-    .default_width(520.0)
-    .frame(theme::hero_frame())
-    .show(ctx, |ui| {
-        ui.label(theme::heading(format!("Gold {}", gold.0)));
-        ui.columns(2, |cols| {
-            cols[0].label(theme::heading("Buy"));
-            let mut stock: Vec<&ItemData> = data.items.values().collect();
-            stock.sort_by(|a, b| a.name.cmp(&b.name));
-            for item in stock.into_iter().take(8) {
-                let can_buy = gold.0 >= item.value && inventory.items.len() < INVENTORY_CAPACITY;
-                cols[0].horizontal(|ui| {
-                    ui.label(item.name.as_str());
-                    ui.label(theme::flavour(format!("{}g", item.value)));
-                    if ui.add_enabled(can_buy, egui::Button::new("Buy")).clicked() {
-                        gold.0 -= item.value;
-                        inventory.items.push(item.id.clone());
-                        inv_changed.write(InventoryChanged);
-                    }
-                });
-            }
+    ui.label(
+        egui::RichText::new(format!("{} — {} talent points", character.name, points.0))
+            .color(theme::GOLD)
+            .strong(),
+    );
+    ui.add_space(6.0);
 
-            cols[1].label(theme::heading("Sell"));
-            let mut sold_index = None;
-            for (index, item_id) in inventory.items.iter().enumerate() {
-                let Some(item) = data.items.get(item_id) else {
-                    continue;
-                };
-                let price = (item.value / 2).max(1);
-                cols[1].horizontal(|ui| {
-                    ui.label(item.name.as_str());
-                    ui.label(theme::flavour(format!("{}g", price)));
-                    if ui.button("Sell").clicked() {
-                        sold_index = Some((index, price));
-                    }
-                });
-            }
-            if let Some((index, price)) = sold_index {
-                inventory.items.remove(index);
-                gold.0 = gold.0.saturating_add(price);
-                inv_changed.write(InventoryChanged);
+    if can_unlock_subclass(character) {
+        ui.label(theme::heading("Choose a Subclass (level 10)"));
+        let mut classes: Vec<&ClassData> = data.classes.values().collect();
+        classes.sort_by(|a, b| a.name.cmp(&b.name));
+        ui.horizontal_wrapped(|ui| {
+            for class in classes {
+                if class.id != character.class && ui.button(class.name.as_str()).clicked() {
+                    *subclass_pick = Some(class.id.clone());
+                }
             }
         });
-    });
-    inventory.shop_open = open;
-}
-
-// ===== Small helpers ===============================================
-
-fn item_tile(ui: &mut egui::Ui, name: &str, frame_color: egui::Color32) {
-    let initial = name.chars().next().unwrap_or('?').to_ascii_uppercase();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
-    ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(4), theme::PANEL_LIGHT);
-    ui.painter().rect_stroke(
-        rect,
-        egui::CornerRadius::same(4),
-        egui::Stroke::new(2.0, frame_color),
-        egui::StrokeKind::Outside,
-    );
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        initial,
-        egui::FontId::proportional(16.0),
-        theme::GOLD_BRIGHT,
-    );
-}
-
-fn item_stat_line(item: &ItemData, instance: Option<&ItemInstance>) -> String {
-    let mut parts = Vec::new();
-    if item.armor_bonus != 0 {
-        parts.push(format!("+{} armor", item.armor_bonus));
+        ui.separator();
     }
-    if let Some(dmg) = &item.damage {
-        parts.push(format!(
-            "{}d{}{}",
+
+    let Some(tree) = data.talent_trees.get(&character.class) else {
+        ui.label(theme::flavour("No talent tree for this class yet."));
+        return;
+    };
+    let mut nodes: Vec<&TalentNodeData> = tree.nodes.iter().collect();
+    nodes.sort_by_key(|n| (n.rank, n.id.clone()));
+    for node in nodes {
+        let taken = talents.0.contains(&node.id);
+        let prereqs = node.requires.iter().all(|r| talents.0.contains(r));
+        let affordable =
+            points.0 >= node.cost && character.level >= node.unlock_level && prereqs && !taken;
+        theme::card_frame(taken).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let color = if taken {
+                    theme::GOLD_BRIGHT
+                } else {
+                    theme::INK
+                };
+                ui.label(egui::RichText::new(&node.name).color(color).strong());
+                ui.label(theme::flavour(format!(
+                    "rank {} · cost {}",
+                    node.rank, node.cost
+                )));
+                if taken {
+                    ui.label(
+                        egui::RichText::new("learned")
+                            .color(theme::VERDANT)
+                            .size(12.0),
+                    );
+                } else if ui
+                    .add_enabled(affordable, egui::Button::new("Learn"))
+                    .clicked()
+                {
+                    *pick = Some(node.id.clone());
+                }
+            });
+            ui.label(theme::flavour(node.description.as_str()));
+            if node.unlock_level > character.level {
+                ui.label(
+                    egui::RichText::new(format!("requires level {}", node.unlock_level))
+                        .color(theme::BLOOD)
+                        .size(12.0),
+                );
+            }
+        });
+    }
+}
+
+// ===== Item rendering helpers ======================================
+
+fn item_label(ui: &mut egui::Ui, id: &str, instances: &ItemInstances, data: &GameData) {
+    let name = item_display_name(id, instances, data);
+    let color = rarity_color(id, instances, data);
+    ui.label(egui::RichText::new(name).color(color).strong());
+}
+
+fn item_tooltip(ui: &mut egui::Ui, id: &str, instances: &ItemInstances, data: &GameData) {
+    let Some(base) = base_item_for_instance(id, data, instances) else {
+        return;
+    };
+    let instance = instances.instances.get(id);
+    let rarity = instance.map(|i| i.rarity).unwrap_or(Rarity::Common);
+    let rarity_name = data
+        .rarities
+        .get(&rarity)
+        .map(|r| r.name.clone())
+        .unwrap_or_else(|| format!("{rarity:?}"));
+    ui.label(
+        egui::RichText::new(base.name.as_str())
+            .color(rarity_color(id, instances, data))
+            .strong()
+            .size(15.0),
+    );
+    ui.label(theme::flavour(rarity_name));
+    ui.label(base.description.as_str());
+    if base.armor_bonus != 0 {
+        ui.label(format!("Armor +{}", base.armor_bonus));
+    }
+    if let Some(dmg) = &base.damage {
+        ui.label(format!(
+            "Damage {}d{}{}",
             dmg.count,
             dmg.sides,
             theme::signed(dmg.modifier)
         ));
     }
-    if let Some(instance) = instance {
-        parts.push(format!("{:?}", instance.rarity));
-        parts.push(format!("{}g", instance.value));
-    } else {
-        parts.push("Common".to_string());
-        parts.push(format!("{}g", item.value));
+    if let Some(cat) = base.consumable {
+        ui.label(theme::flavour(format!("Consumable ({cat:?})")));
     }
-    parts.join("  ·  ")
-}
-
-fn item_tooltip(item: &ItemData, instance: Option<&ItemInstance>, data: &GameData) -> String {
-    let mut lines = vec![item.description.clone()];
     if let Some(instance) = instance {
-        let rarity = data
-            .rarities
-            .get(&instance.rarity)
-            .map(|rarity| rarity.name.as_str())
-            .unwrap_or("Unknown");
-        lines.push(format!("Rarity: {rarity}"));
         for affix in &instance.affixes {
-            lines.push(format!("{} {:+}", affix.name, affix.value));
+            ui.label(
+                egui::RichText::new(format!("{} {}", affix.name, theme::signed(affix.value)))
+                    .color(theme::ARCANE),
+            );
         }
-    } else {
-        lines.push("Rarity: Common".to_string());
+        ui.label(theme::flavour(format!("Value {}g", instance.value)));
     }
-    if let Some(category) = item.consumable {
-        lines.push(format!("Consumable: {category:?}"));
-    }
-    lines.join("\n")
 }
 
-fn rarity_color(instance: Option<&ItemInstance>, data: &GameData) -> egui::Color32 {
-    let rarity = instance.map(|item| item.rarity).unwrap_or(Rarity::Common);
-    rarity_frame_color(data, rarity)
-        .map(|color| egui::Color32::from_rgba_premultiplied(color.r, color.g, color.b, color.a))
-        .unwrap_or(theme::INK_DIM)
+fn item_display_name(id: &str, instances: &ItemInstances, data: &GameData) -> String {
+    base_item_for_instance(id, data, instances)
+        .map(|b| b.name.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn rarity_color(id: &str, instances: &ItemInstances, data: &GameData) -> egui::Color32 {
+    instances
+        .instances
+        .get(id)
+        .and_then(|i| rarity_frame_color(data, i.rarity))
+        .map(theme::frame_color)
+        .unwrap_or(theme::INK)
+}
+
+fn rarity_frame(id: &str, instances: &ItemInstances, data: &GameData) -> egui::Frame {
+    theme::rarity_card(rarity_color(id, instances, data), false)
 }
 
 fn ability_rows(a: Abilities) -> [(&'static str, u8); 6] {
@@ -623,10 +833,10 @@ fn ability_rows(a: Abilities) -> [(&'static str, u8); 6] {
     ]
 }
 
-fn item_name(id: &str, data: &GameData, instances: &ItemInstances) -> String {
-    base_item_for_instance(id, data, instances)
-        .map(|i| i.name.clone())
-        .unwrap_or_else(|| id.to_string())
+fn talent_node<'a>(class: &str, node_id: &str, data: &'a GameData) -> Option<&'a TalentNodeData> {
+    data.talent_trees
+        .get(class)
+        .and_then(|tree| tree.nodes.iter().find(|n| n.id == node_id))
 }
 
 fn race_name(id: &str, data: &GameData) -> String {

@@ -1,14 +1,18 @@
 //! Animated character creation, driven by the [`CreationStep`] sub-state.
 //!
-//! The flow walks Race → Class → AbilityRoll → SkillsTraits → Review and repeats
-//! for up to four party members. We collect choices into a [`CreationDraft`],
-//! and on Review confirm we build the member entity using `starwood_core`'s
-//! *public* rules functions (`apply_race_mods`, `derived_stats`, …) — we never
-//! re-implement rules math here — then fire [`CharacterFinalized`].
+//! New design: the player builds **one full PC** (Race → Class → AbilityRoll →
+//! SkillsTraits → Review) and then picks the **classes of the three companions**
+//! who will join later (Companions step). We collect choices into a
+//! [`CreationDraft`] and drive the live game purely through messages:
 //!
-//! Ability rolls go through the real contract: the button fires
-//! [`RollRequest`]`(AbilityScoreGen)`, the Dice Theater animates each die, and
-//! [`collect_ability_rolls`] reads the authoritative [`RollResolved`] results.
+//! * forward navigation → `CreationStepAdvanceRequested`
+//! * Review confirm → `CharacterBuildRequested` (core spawns the PC entity)
+//! * Companions "Begin" → set `PlannedCompanions` + `FinishPartyCreationRequested`
+//!
+//! Ability rolls go through the contract: the button fires
+//! `RollRequest(AbilityScoreGen)`; core now applies the 4d6-drop-lowest itself,
+//! so `RollResolved.total` is the authoritative score and the Dice Theater
+//! animates it.
 
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
@@ -25,32 +29,28 @@ pub enum AbilityMethod {
     PointBuy,
 }
 
-/// All in-progress choices for the member currently being created.
+/// All in-progress choices for the PC being created, plus the companion plan.
 #[derive(Resource)]
 pub struct CreationDraft {
-    pub member_index: u8,
     pub name: String,
     pub race: Option<RaceId>,
     pub class: Option<ClassId>,
     pub method: AbilityMethod,
-    /// Pool of generated values (6 entries) for Roll / StandardArray methods.
     pub rolled_pool: Vec<u8>,
-    /// Roll ids whose `RollResolved` we are still waiting on (ability gen).
     pub pending_roll_ids: Vec<u64>,
-    /// `assignment[i]` = index into the active pool assigned to ability `i`.
     pub assignment: [Option<usize>; 6],
-    /// Point-buy scores per ability (used when `method == PointBuy`).
     pub point_buy: [u8; 6],
     pub chosen_skills: Vec<SkillId>,
     pub chosen_traits: Vec<TraitId>,
-    /// Monotonic source of roll ids requested by the UI.
+    pub companion_classes: [ClassId; 3],
+    /// Whether the PC has already been submitted via `CharacterBuildRequested`.
+    pub built: bool,
     pub next_roll_id: u64,
 }
 
 impl Default for CreationDraft {
     fn default() -> Self {
         Self {
-            member_index: 0,
             name: "Adventurer".to_string(),
             race: None,
             class: None,
@@ -61,6 +61,8 @@ impl Default for CreationDraft {
             point_buy: [8; 6],
             chosen_skills: Vec::new(),
             chosen_traits: Vec::new(),
+            companion_classes: ["fighter".into(), "cleric".into(), "rogue".into()],
+            built: false,
             next_roll_id: 1,
         }
     }
@@ -75,7 +77,6 @@ impl CreationDraft {
         id
     }
 
-    /// The pool of values being assigned, depending on the active method.
     fn active_pool(&self) -> Vec<u8> {
         match self.method {
             AbilityMethod::Roll => self.rolled_pool.clone(),
@@ -84,7 +85,7 @@ impl CreationDraft {
         }
     }
 
-    /// Base scores (pre-race) implied by the current method + assignment.
+    /// Base scores (pre-race/class mods) implied by the method + assignment.
     fn base_scores(&self) -> [u8; 6] {
         match self.method {
             AbilityMethod::PointBuy => self.point_buy,
@@ -103,18 +104,28 @@ impl CreationDraft {
         }
     }
 
+    fn base_abilities(&self) -> Abilities {
+        let s = self.base_scores();
+        Abilities {
+            str_: s[0],
+            dex: s[1],
+            con: s[2],
+            int: s[3],
+            wis: s[4],
+            cha: s[5],
+        }
+    }
+
     fn skill_budget(&self, data: &GameData) -> usize {
-        // Two class skills, plus one if the race grants the "versatile" trait.
-        let racial = self
+        let versatile = self
             .race
             .as_ref()
             .and_then(|id| data.races.get(id))
             .map(|race| race.traits.iter().any(|t| t == "versatile"))
             .unwrap_or(false);
-        2 + usize::from(racial)
+        2 + usize::from(versatile)
     }
 
-    /// Whether the current step's choices are complete enough to advance.
     fn can_advance(&self, step: &CreationStep, data: &GameData) -> bool {
         match step {
             CreationStep::Race => self.race.is_some(),
@@ -130,45 +141,88 @@ impl CreationDraft {
     }
 }
 
-/// Reset for a brand-new run (first member).
-pub fn reset_draft_for_new_game(draft: &mut CreationDraft, _data: &GameData) {
+/// Reset for a brand-new campaign.
+pub fn reset_draft_for_new_game(draft: &mut CreationDraft) {
     *draft = CreationDraft::default();
 }
 
-fn reset_draft_for_next_member(draft: &mut CreationDraft) {
-    let next_index = draft.member_index + 1;
-    let next_roll_id = draft.next_roll_id;
-    let method = draft.method;
-    *draft = CreationDraft {
-        member_index: next_index,
-        name: format!("Adventurer {}", next_index + 1),
-        method,
-        next_roll_id,
-        ..Default::default()
+pub fn spawn_member_from_saved(
+    commands: &mut Commands,
+    saved: &SavedCharacter,
+    slot: u8,
+    data: &GameData,
+    instances: &ItemInstances,
+) -> Option<Entity> {
+    let race = data.races.get(&saved.race)?;
+    let class = data.classes.get(&saved.class)?;
+    let equipment: Equipment = saved.equipment.clone().into();
+    let mut derived = derived_stats(saved.abilities, saved.level, class, race, &equipment, data);
+    derived.armor_class = armor_class_with_instances(saved.abilities, &equipment, data, instances);
+    let max_hp = derived.max_hp.max(1);
+    let health = Health {
+        current: saved.health_current.clamp(0, max_hp),
+        max: max_hp,
     };
+    let mut mana = mana_for_class(class, saved.abilities, saved.level);
+    mana.current = saved.mana_current.clamp(0, mana.max);
+
+    let entity = commands
+        .spawn((
+            Character {
+                name: saved.name.clone(),
+                race: saved.race.clone(),
+                class: saved.class.clone(),
+                subclass: saved.subclass.clone(),
+                level: saved.level,
+                xp: saved.xp,
+            },
+            saved.abilities,
+            derived,
+            health,
+            mana,
+            cooldowns_for_class(class),
+            SkillSet {
+                proficient: saved.skills.clone(),
+            },
+            Traits(saved.traits.clone()),
+            Talents(saved.talents.clone()),
+            TalentPoints(saved.talent_points),
+            RevivePenalty {
+                stacks: saved.revive_penalty_stacks,
+            },
+            equipment,
+            SpriteParts {
+                base_body: race.sprite_key.clone(),
+            },
+            PartyMember { slot },
+        ))
+        .id();
+    if slot == 0 {
+        commands.entity(entity).insert(PlayerCharacter);
+    }
+    if health.current <= 0 && slot == 0 {
+        commands.entity(entity).insert(Downed);
+    }
+    Some(entity)
 }
 
 // ===== The screen ==================================================
 
-#[allow(clippy::too_many_arguments)]
 pub fn creation_ui(
     mut contexts: EguiContexts,
     mut draft: ResMut<CreationDraft>,
     step_state: Res<State<CreationStep>>,
     mut next_step: ResMut<NextState<CreationStep>>,
-    mut next_game: ResMut<NextState<GameState>>,
-    mut roster: ResMut<PartyRoster>,
     mut planned: ResMut<PlannedCompanions>,
-    mut map: ResMut<MapState>,
     data: Res<GameData>,
     mut rolls: EventWriter<RollRequest>,
-    mut finalized: EventWriter<CharacterFinalized>,
-    mut commands: Commands,
+    mut advance: EventWriter<CreationStepAdvanceRequested>,
+    mut build: EventWriter<CharacterBuildRequested>,
+    mut finish: EventWriter<FinishPartyCreationRequested>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
     let step = step_state.get().clone();
 
-    // Gentle slide-in whenever the step changes (animated, not snappy).
     let appear = ctx.animate_bool_with_time(
         egui::Id::new(("creation_step", std::mem::discriminant(&step))),
         true,
@@ -176,7 +230,6 @@ pub fn creation_ui(
     );
     let slide = (1.0 - appear) * 26.0;
 
-    // Top: progress through the creation steps.
     egui::TopBottomPanel::top("creation_progress")
         .frame(theme::panel_frame())
         .show(ctx, |ui| {
@@ -187,7 +240,6 @@ pub fn creation_ui(
             });
         });
 
-    // Bottom: navigation.
     egui::TopBottomPanel::bottom("creation_nav")
         .frame(theme::panel_frame())
         .show(ctx, |ui| {
@@ -204,53 +256,29 @@ pub fn creation_ui(
                     let can = draft.can_advance(&step, &data);
                     match &step {
                         CreationStep::Review => {
-                            // Confirm finalises the member.
-                            if ui.add(primary_button("✓ Confirm Member")).clicked() {
-                                if let Some(entity) = finalize_member(
-                                    &mut commands,
-                                    &draft,
-                                    &data,
-                                    roster.members.len() as u8,
-                                ) {
-                                    roster.members.push(entity);
-                                    finalized.write(CharacterFinalized { entity });
-                                    if !roster.members.is_empty() {
-                                        next_step.set(CreationStep::Companions);
-                                    } else {
-                                        reset_draft_for_next_member(&mut draft);
-                                        next_step.set(CreationStep::Race);
+                            let label = if draft.built {
+                                "Companions ▶"
+                            } else {
+                                "✓ Create Hero"
+                            };
+                            if ui.add(primary_button(label)).clicked() {
+                                if !draft.built {
+                                    if let Some(request) = build_request(&draft) {
+                                        build.write(request);
+                                        draft.built = true;
                                     }
                                 }
-                            }
-                            if !roster.members.is_empty()
-                                && ui
-                                    .button(egui::RichText::new("Begin Expedition »").size(16.0))
-                                    .clicked()
-                            {
-                                // Finalise this member too, then march.
-                                if let Some(entity) = finalize_member(
-                                    &mut commands,
-                                    &draft,
-                                    &data,
-                                    roster.members.len() as u8,
-                                ) {
-                                    roster.members.push(entity);
-                                    finalized.write(CharacterFinalized { entity });
+                                // Advance once the PC exists (also re-advances if the
+                                // player stepped Back here after building).
+                                if draft.built {
+                                    advance.write(CreationStepAdvanceRequested);
                                 }
-                                begin_expedition(&mut next_game, &mut map);
                             }
                         }
                         CreationStep::Companions => {
-                            let can_begin = !roster.members.is_empty()
-                                && planned
-                                    .classes
-                                    .iter()
-                                    .all(|id| data.classes.contains_key(id));
-                            if ui
-                                .add_enabled(can_begin, primary_button("Begin Expedition"))
-                                .clicked()
-                            {
-                                begin_expedition(&mut next_game, &mut map);
+                            if ui.add(primary_button("Begin Expedition »")).clicked() {
+                                planned.classes = draft.companion_classes.clone();
+                                finish.write(FinishPartyCreationRequested);
                             }
                         }
                         _ => {
@@ -260,9 +288,7 @@ pub fn creation_ui(
                                 "Continue ▶"
                             };
                             if ui.add_enabled(can, primary_button(label)).clicked() {
-                                if let Some(next) = next_step_of(&step) {
-                                    next_step.set(next);
-                                }
+                                advance.write(CreationStepAdvanceRequested);
                             }
                         }
                     }
@@ -280,11 +306,22 @@ pub fn creation_ui(
                 CreationStep::AbilityRoll => ability_step(ui, &mut draft, &data, &mut rolls),
                 CreationStep::SkillsTraits => skills_step(ui, &mut draft, &data),
                 CreationStep::Review => review_step(ui, &draft, &data),
-                CreationStep::Companions => companions_step(ui, &mut planned, &data),
+                CreationStep::Companions => companions_step(ui, &mut draft, &data),
             });
         });
 
     Ok(())
+}
+
+fn build_request(draft: &CreationDraft) -> Option<CharacterBuildRequested> {
+    Some(CharacterBuildRequested {
+        name: draft.name.clone(),
+        race: draft.race.clone()?,
+        class: draft.class.clone()?,
+        abilities: draft.base_abilities(),
+        skills: draft.chosen_skills.clone(),
+        traits: draft.chosen_traits.clone(),
+    })
 }
 
 // ===== Steps =======================================================
@@ -304,7 +341,6 @@ fn race_step(ui: &mut egui::Ui, draft: &mut CreationDraft, data: &GameData) {
 
     let mut races: Vec<&RaceData> = data.races.values().collect();
     races.sort_by(|a, b| a.name.cmp(&b.name));
-
     for race in races {
         let selected = draft.race.as_deref() == Some(race.id.as_str());
         theme::card_frame(selected).show(ui, |ui| {
@@ -345,7 +381,6 @@ fn class_step(ui: &mut egui::Ui, draft: &mut CreationDraft, data: &GameData) {
 
     let mut classes: Vec<&ClassData> = data.classes.values().collect();
     classes.sort_by(|a, b| a.name.cmp(&b.name));
-
     for class in classes {
         let selected = draft.class.as_deref() == Some(class.id.as_str());
         theme::card_frame(selected).show(ui, |ui| {
@@ -359,7 +394,10 @@ fn class_step(ui: &mut egui::Ui, draft: &mut CreationDraft, data: &GameData) {
                 {
                     draft.class = Some(class.id.clone());
                 }
-                ui.label(theme::flavour(format!("d{} hit die", class.hit_die)));
+                ui.label(theme::flavour(format!(
+                    "d{} hit die  ·  {} mana",
+                    class.hit_die, class.base_mana
+                )));
             });
             ui.label(class.description.as_str());
             ui.label(
@@ -367,10 +405,6 @@ fn class_step(ui: &mut egui::Ui, draft: &mut CreationDraft, data: &GameData) {
                     .color(theme::ARCANE)
                     .size(13.0),
             );
-            ui.label(theme::flavour(format!(
-                "Starting kit: {}",
-                item_names(&class.starting_kit, data)
-            )));
         });
     }
 }
@@ -383,7 +417,6 @@ fn ability_step(
 ) {
     ui.label(theme::title("Forge the Body & Mind"));
     ui.add_space(4.0);
-
     ui.horizontal(|ui| {
         ui.label("Method:");
         method_radio(ui, draft, AbilityMethod::Roll, "4d6 drop lowest");
@@ -433,9 +466,7 @@ fn ability_step(
             ui.add_space(6.0);
             assignment_grid(ui, draft);
         }
-        AbilityMethod::PointBuy => {
-            point_buy_grid(ui, draft);
-        }
+        AbilityMethod::PointBuy => point_buy_grid(ui, draft),
     }
 
     ui.add_space(10.0);
@@ -502,7 +533,6 @@ fn skills_step(ui: &mut egui::Ui, draft: &mut CreationDraft, data: &GameData) {
 fn review_step(ui: &mut egui::Ui, draft: &CreationDraft, data: &GameData) {
     ui.label(theme::title("Review"));
     ui.add_space(6.0);
-
     let race = draft.race.as_ref().and_then(|id| data.races.get(id));
     let class = draft.class.as_ref().and_then(|id| data.classes.get(id));
 
@@ -521,11 +551,10 @@ fn review_step(ui: &mut egui::Ui, draft: &CreationDraft, data: &GameData) {
         ui.add_space(8.0);
 
         if let (Some(race), Some(class)) = (race, class) {
-            let base = abilities_from(draft.base_scores());
-            let final_abilities = apply_race_mods(base, &race.ability_mods);
-            let equipment = equipment_from_kit(&class.starting_kit, data);
-            let derived = derived_stats(final_abilities, 1, class, race, &equipment, data);
-
+            let final_abilities = apply_class_mods(
+                apply_race_mods(draft.base_abilities(), &race.ability_mods),
+                class,
+            );
             egui::Grid::new("review_abilities")
                 .striped(true)
                 .show(ui, |ui| {
@@ -538,15 +567,6 @@ fn review_step(ui: &mut egui::Ui, draft: &CreationDraft, data: &GameData) {
                     }
                 });
             ui.add_space(8.0);
-            ui.label(format!(
-                "HP {}   AC {}   Init {}   Prof {}   Speed {}",
-                derived.max_hp,
-                derived.armor_class,
-                theme::signed(derived.initiative_mod),
-                theme::signed(derived.proficiency),
-                derived.speed,
-            ));
-            ui.add_space(4.0);
             if !draft.chosen_skills.is_empty() {
                 ui.label(theme::flavour(format!(
                     "Skills: {}",
@@ -561,64 +581,62 @@ fn review_step(ui: &mut egui::Ui, draft: &CreationDraft, data: &GameData) {
                     trait_names(&all_traits, data)
                 )));
             }
-            ui.label(theme::flavour(format!(
-                "Kit: {}",
-                item_names(&class.starting_kit, data)
-            )));
         }
+        ui.add_space(4.0);
+        ui.label(theme::flavour(
+            "Confirm to forge your hero, then choose your companions.",
+        ));
     });
 }
 
-fn companions_step(ui: &mut egui::Ui, planned: &mut PlannedCompanions, data: &GameData) {
-    ui.label(theme::title("Plan Your Companions"));
+fn companions_step(ui: &mut egui::Ui, draft: &mut CreationDraft, data: &GameData) {
+    ui.label(theme::title("Your Companions"));
     ui.label(theme::flavour(
-        "Choose the three classes that will join your story later.",
+        "You start alone. Choose the calling of the three who will join you on the road — \
+         their names and stories are written when you meet them.",
     ));
-    ui.add_space(8.0);
+    ui.add_space(10.0);
 
     let mut classes: Vec<&ClassData> = data.classes.values().collect();
     classes.sort_by(|a, b| a.name.cmp(&b.name));
-    for index in 0..planned.classes.len() {
+
+    for slot in 0..3 {
         theme::card_frame(false).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(theme::heading(format!("Companion {}", index + 1)));
-                egui::ComboBox::from_id_salt(("planned_companion", index))
-                    .selected_text(class_name(&planned.classes[index], data))
+                ui.label(
+                    egui::RichText::new(format!("Companion {}", slot + 1))
+                        .color(theme::GOLD)
+                        .strong(),
+                );
+                let current = draft.companion_classes[slot].clone();
+                let current_name = data
+                    .classes
+                    .get(&current)
+                    .map(|c| c.name.clone())
+                    .unwrap_or(current);
+                egui::ComboBox::from_id_salt(("companion", slot))
+                    .selected_text(current_name)
                     .show_ui(ui, |ui| {
                         for class in &classes {
                             ui.selectable_value(
-                                &mut planned.classes[index],
+                                &mut draft.companion_classes[slot],
                                 class.id.clone(),
                                 class.name.as_str(),
                             );
                         }
                     });
             });
-            if let Some(class) = data.classes.get(&planned.classes[index]) {
+            if let Some(class) = data.classes.get(&draft.companion_classes[slot]) {
                 ui.label(theme::flavour(class.description.as_str()));
-                ui.label(theme::flavour(format!(
-                    "Abilities: {}",
-                    class.class_abilities.join(", ")
-                )));
             }
         });
     }
-
-    ui.add_space(10.0);
-    ui.label(theme::heading("Planned Party"));
-    ui.horizontal_wrapped(|ui| {
-        ui.label(theme::flavour("Hero"));
-        for class_id in &planned.classes {
-            ui.label(egui::RichText::new(class_name(class_id, data)).color(theme::GOLD));
-        }
-    });
 }
 
 // ===== Roll collection =============================================
 
-/// Reads authoritative `RollResolved` events for our pending ability-gen rolls
-/// and turns each into a score (sum of the top three of the four dice — the
-/// "drop lowest" the contract's resolver doesn't apply itself).
+/// Reads authoritative `RollResolved` ability-gen events. Core already applies
+/// 4d6-drop-lowest, so `total` is the score — we no longer compute dice here.
 pub fn collect_ability_rolls(
     mut resolved: EventReader<RollResolved>,
     mut draft: ResMut<CreationDraft>,
@@ -629,150 +647,9 @@ pub fn collect_ability_rolls(
         }
         if let Some(pos) = draft.pending_roll_ids.iter().position(|id| *id == event.id) {
             draft.pending_roll_ids.remove(pos);
-            draft.rolled_pool.push((event.total as u8).clamp(3, 18));
+            draft.rolled_pool.push(event.total.clamp(3, 18) as u8);
         }
     }
-}
-
-// ===== Member construction (shared with the save loader) ===========
-
-fn equipment_from_kit(kit: &[ItemId], data: &GameData) -> Equipment {
-    let mut eq = Equipment::default();
-    for id in kit {
-        let Some(item) = data.items.get(id) else {
-            continue;
-        };
-        match item.slot {
-            ItemSlot::Head => eq.head = Some(id.clone()),
-            ItemSlot::Body => eq.body = Some(id.clone()),
-            ItemSlot::MainHand => eq.main_hand = Some(id.clone()),
-            ItemSlot::OffHand => eq.off_hand = Some(id.clone()),
-            ItemSlot::Feet => eq.feet = Some(id.clone()),
-            ItemSlot::Consumable | ItemSlot::Treasure => {}
-        }
-    }
-    eq
-}
-
-fn finalize_member(
-    commands: &mut Commands,
-    draft: &CreationDraft,
-    data: &GameData,
-    slot: u8,
-) -> Option<Entity> {
-    let race = data.races.get(draft.race.as_ref()?)?;
-    let class = data.classes.get(draft.class.as_ref()?)?;
-
-    let base = abilities_from(draft.base_scores());
-    let abilities = apply_race_mods(base, &race.ability_mods);
-    let equipment = equipment_from_kit(&class.starting_kit, data);
-    let derived = derived_stats(abilities, 1, class, race, &equipment, data);
-
-    let mut traits = race.traits.clone();
-    traits.extend(draft.chosen_traits.clone());
-
-    let entity = commands
-        .spawn((
-            Character {
-                name: draft.name.clone(),
-                race: race.id.clone(),
-                class: class.id.clone(),
-                subclass: None,
-                level: 1,
-                xp: 0,
-            },
-            abilities,
-            derived,
-            Health {
-                current: derived.max_hp,
-                max: derived.max_hp,
-            },
-            mana_for_class(class, abilities, 1),
-            cooldowns_for_class(class),
-            SkillSet {
-                proficient: draft.chosen_skills.clone(),
-            },
-            Traits(traits),
-            Talents::default(),
-            TalentPoints::default(),
-            RevivePenalty::default(),
-            PlayerCharacter,
-            PartyMember { slot },
-            equipment,
-            SpriteParts {
-                base_body: race.sprite_key.clone(),
-            },
-        ))
-        .id();
-    Some(entity)
-}
-
-/// Rebuild a member entity from a saved record (used by the Continue flow).
-pub fn spawn_member_from_saved(
-    commands: &mut Commands,
-    saved: &SavedCharacter,
-    slot: u8,
-    data: &GameData,
-) -> Option<Entity> {
-    let race = data.races.get(&saved.race)?;
-    let class = data.classes.get(&saved.class)?;
-    let equipment: Equipment = saved.equipment.clone().into();
-    let derived = derived_stats(saved.abilities, saved.level, class, race, &equipment, data);
-
-    let entity = commands
-        .spawn((
-            Character {
-                name: saved.name.clone(),
-                race: saved.race.clone(),
-                class: saved.class.clone(),
-                subclass: saved.subclass.clone(),
-                level: saved.level,
-                xp: saved.xp,
-            },
-            saved.abilities,
-            derived,
-            Health {
-                current: saved.health_current,
-                max: derived.max_hp,
-            },
-            Mana {
-                current: saved.mana_current,
-                max: mana_for_class(class, saved.abilities, saved.level).max,
-            },
-            cooldowns_for_class(class),
-            SkillSet {
-                proficient: saved.skills.clone(),
-            },
-            Traits(saved.traits.clone()),
-            Talents(saved.talents.clone()),
-            TalentPoints(saved.talent_points),
-            RevivePenalty {
-                stacks: saved.revive_penalty_stacks,
-            },
-            PartyMember { slot },
-            equipment,
-            SpriteParts {
-                base_body: race.sprite_key.clone(),
-            },
-        ))
-        .id();
-    if slot == 0 {
-        commands.entity(entity).insert(PlayerCharacter);
-    }
-    Some(entity)
-}
-
-fn begin_expedition(next_game: &mut NextState<GameState>, map: &mut MapState) {
-    if map.nodes.is_empty() {
-        // A fresh, run-specific seed. It is captured in the map (and the save),
-        // so the run stays reproducible from that point on.
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x57A2_0D0D);
-        *map = generate_map(seed, 8);
-    }
-    next_game.set(GameState::Exploration);
 }
 
 // ===== Small widgets & helpers =====================================
@@ -784,7 +661,7 @@ fn primary_button(label: &str) -> egui::Button<'static> {
             .color(theme::INK),
     )
     .fill(theme::GOLD.gamma_multiply(0.30))
-    .min_size(egui::vec2(150.0, 32.0))
+    .min_size(egui::vec2(160.0, 32.0))
 }
 
 fn method_radio(ui: &mut egui::Ui, draft: &mut CreationDraft, method: AbilityMethod, label: &str) {
@@ -835,11 +712,11 @@ fn assignment_grid(ui: &mut egui::Ui, draft: &mut CreationDraft) {
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut draft.assignment[i], None, "—");
                         for (idx, value) in pool.iter().enumerate() {
-                            let taken_elsewhere = snapshot
+                            let taken = snapshot
                                 .iter()
                                 .enumerate()
                                 .any(|(j, a)| j != i && *a == Some(idx));
-                            if !taken_elsewhere {
+                            if !taken {
                                 ui.selectable_value(
                                     &mut draft.assignment[i],
                                     Some(idx),
@@ -880,8 +757,7 @@ fn point_buy_grid(ui: &mut egui::Ui, draft: &mut CreationDraft) {
                     draft.point_buy[i] -= 1;
                 }
                 ui.label(egui::RichText::new(score.to_string()).size(16.0).strong());
-                let next_cost = point_buy_cost(score + 1);
-                let affordable = next_cost
+                let affordable = point_buy_cost(score + 1)
                     .map(|c| {
                         (spent + c as u32).saturating_sub(point_buy_cost(score).unwrap_or(0) as u32)
                             <= 27
@@ -905,9 +781,12 @@ fn ability_preview(ui: &mut egui::Ui, draft: &CreationDraft, data: &GameData) {
     let Some(race) = draft.race.as_ref().and_then(|id| data.races.get(id)) else {
         return;
     };
-    let base = abilities_from(draft.base_scores());
-    let final_abilities = apply_race_mods(base, &race.ability_mods);
-    ui.label(theme::heading("With lineage bonuses"));
+    let class = draft.class.as_ref().and_then(|id| data.classes.get(id));
+    let mut final_abilities = apply_race_mods(draft.base_abilities(), &race.ability_mods);
+    if let Some(class) = class {
+        final_abilities = apply_class_mods(final_abilities, class);
+    }
+    ui.label(theme::heading("With lineage & calling bonuses"));
     egui::Grid::new("ability_preview")
         .num_columns(6)
         .striped(true)
@@ -952,17 +831,6 @@ fn step_breadcrumbs(ui: &mut egui::Ui, current: &CreationStep) {
     });
 }
 
-fn next_step_of(step: &CreationStep) -> Option<CreationStep> {
-    match step {
-        CreationStep::Race => Some(CreationStep::Class),
-        CreationStep::Class => Some(CreationStep::AbilityRoll),
-        CreationStep::AbilityRoll => Some(CreationStep::SkillsTraits),
-        CreationStep::SkillsTraits => Some(CreationStep::Review),
-        CreationStep::Review => Some(CreationStep::Companions),
-        CreationStep::Companions => None,
-    }
-}
-
 fn previous_step(step: &CreationStep) -> Option<CreationStep> {
     match step {
         CreationStep::Race => None,
@@ -971,17 +839,6 @@ fn previous_step(step: &CreationStep) -> Option<CreationStep> {
         CreationStep::SkillsTraits => Some(CreationStep::AbilityRoll),
         CreationStep::Review => Some(CreationStep::SkillsTraits),
         CreationStep::Companions => Some(CreationStep::Review),
-    }
-}
-
-fn abilities_from(scores: [u8; 6]) -> Abilities {
-    Abilities {
-        str_: scores[0],
-        dex: scores[1],
-        con: scores[2],
-        int: scores[3],
-        wis: scores[4],
-        cha: scores[5],
     }
 }
 
@@ -1016,17 +873,6 @@ fn trait_names(ids: &[TraitId], data: &GameData) -> String {
 
 fn skill_names(ids: &[SkillId], data: &GameData) -> String {
     join_names(ids, |id| data.skills.get(id).map(|s| s.name.clone()))
-}
-
-fn item_names(ids: &[ItemId], data: &GameData) -> String {
-    join_names(ids, |id| data.items.get(id).map(|i| i.name.clone()))
-}
-
-fn class_name(id: &str, data: &GameData) -> String {
-    data.classes
-        .get(id)
-        .map(|class| class.name.clone())
-        .unwrap_or_else(|| id.to_string())
 }
 
 fn join_names(ids: &[String], lookup: impl Fn(&String) -> Option<String>) -> String {
