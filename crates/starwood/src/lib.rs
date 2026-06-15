@@ -508,7 +508,7 @@ mod tests {
             },
         });
 
-        for _ in 0..120 {
+        for _ in 0..1_000 {
             app.update();
             if app
                 .world()
@@ -524,22 +524,22 @@ mod tests {
             app.update();
         }
 
+        let debug_state = app.world().resource::<DebugHarnessState>();
+        let game_state = app.world().resource::<State<GameState>>().get().clone();
+        let inventory = app.world().resource::<Inventory>().items.clone();
+        let enemy_count = app.world().resource::<EncounterState>().enemies.len();
+        let pending_intents = app.world().resource::<PendingRolls>().attack_intents.len();
+        let pending_attacks = app.world().resource::<PendingRolls>().attacks.len();
+
         assert!(
-            app.world()
-                .resource::<DebugHarnessState>()
-                .completed_victory
+            debug_state.completed_victory,
+            "headless smoke did not complete victory: state={game_state:?}, \
+             enemy_count={enemy_count}, inventory={inventory:?}, \
+             pending_intents={pending_intents}, pending_attacks={pending_attacks}, \
+             debug={debug_state:?}"
         );
-        assert_eq!(
-            app.world().resource::<State<GameState>>().get(),
-            &GameState::Exploration
-        );
-        assert!(
-            app.world()
-                .resource::<Inventory>()
-                .items
-                .iter()
-                .any(|id| id.starts_with("iron_sword:2:"))
-        );
+        assert_eq!(game_state, GameState::Exploration);
+        assert!(inventory.iter().any(|id| id.starts_with("iron_sword:2:")));
 
         let mut party = app
             .world_mut()
